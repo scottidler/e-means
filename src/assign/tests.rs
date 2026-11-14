@@ -9,6 +9,7 @@ fn direct_nearest(rows: &[f32], centroids: &[f32], d: usize) -> (Vec<u32>, Vec<f
         Metric::L2,
         rows,
         centroids,
+        &[],
         d,
         &mut labels,
         &mut distances,
@@ -65,6 +66,7 @@ fn mismatched_buffers_panic() {
         Metric::L2,
         &[1.0, 2.0, 3.0],
         &[0.0],
+        &[],
         1,
         &mut labels,
         &mut distances,
@@ -80,6 +82,7 @@ fn inner_product_nearest(rows: &[f32], centroids: &[f32], d: usize) -> (Vec<u32>
         Metric::InnerProduct,
         rows,
         centroids,
+        &[],
         d,
         &mut labels,
         &mut products,
@@ -117,6 +120,7 @@ fn mismatched_score_buffer_panics() {
         Metric::InnerProduct,
         &[1.0],
         &[0.0],
+        &[],
         1,
         &mut labels,
         &mut products,
@@ -127,7 +131,17 @@ fn gemm_nearest_of(metric: Metric, rows: &[f32], centroids: &[f32], d: usize) ->
     let n = rows.len() / d;
     let mut labels = vec![u32::MAX; n];
     let mut scores = vec![f32::NAN; n];
-    nearest(Kernel::Gemm, metric, rows, centroids, d, &mut labels, &mut scores);
+    let norms = centroid_norms(Kernel::Gemm, metric, centroids, d);
+    nearest(
+        Kernel::Gemm,
+        metric,
+        rows,
+        centroids,
+        &norms,
+        d,
+        &mut labels,
+        &mut scores,
+    );
     (labels, scores)
 }
 
@@ -405,7 +419,8 @@ fn production_nearest(
     let n = rows.len() / d;
     let mut labels = vec![u32::MAX; n];
     let mut scores = vec![f32::NAN; n];
-    nearest(kernel, metric, rows, centroids, d, &mut labels, &mut scores);
+    let norms = centroid_norms(kernel, metric, centroids, d);
+    nearest(kernel, metric, rows, centroids, &norms, d, &mut labels, &mut scores);
     (labels, scores.iter().map(|s| s.to_bits()).collect())
 }
 
@@ -558,4 +573,83 @@ fn an_all_infinite_score_row_takes_index_zero_and_keeps_the_infinity() {
             );
         }
     }
+}
+
+/// The sequential strict scan `lane_scan` replaces: first index at the best score.
+fn sequential_scan(scores: &[f32], worst: f32, better: impl Fn(f32, f32) -> bool) -> (u32, f32) {
+    let (mut best, mut best_id) = (worst, 0u32);
+    for (j, &v) in scores.iter().enumerate() {
+        if better(v, best) {
+            best = v;
+            best_id = j as u32;
+        }
+    }
+    (best_id, best)
+}
+
+#[test]
+fn lane_scan_equals_a_sequential_scan_bitwise_on_tie_heavy_data() {
+    for len in (0..=70).chain([255, 256, 257]) {
+        for seed in 0..20u64 {
+            // Four distinct values, so equal minima fall in the same lane, across lanes and in the tail.
+            let mut scores: Vec<f32> = lcg_values(len, seed * 31 + len as u64)
+                .iter()
+                .map(|v| (v * 2.0).floor())
+                .collect();
+            if seed % 5 == 1 && len > 3 {
+                scores[len / 2] = f32::NAN;
+            }
+            if seed % 5 == 2 {
+                scores.iter_mut().for_each(|v| *v = f32::INFINITY);
+            }
+            if seed % 5 == 3 {
+                scores.iter_mut().for_each(|v| *v = f32::NEG_INFINITY);
+            }
+            let min = lane_scan(&scores, f32::INFINITY, |v, b| v < b);
+            let want = sequential_scan(&scores, f32::INFINITY, |v, b| v < b);
+            assert_eq!(
+                (min.0, min.1.to_bits()),
+                (want.0, want.1.to_bits()),
+                "min len={len} seed={seed}"
+            );
+            let max = lane_scan(&scores, f32::NEG_INFINITY, |v, b| v > b);
+            let want = sequential_scan(&scores, f32::NEG_INFINITY, |v, b| v > b);
+            assert_eq!(
+                (max.0, max.1.to_bits()),
+                (want.0, want.1.to_bits()),
+                "max len={len} seed={seed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lane_scan_of_nothing_is_id_zero_at_the_identity() {
+    assert_eq!(lane_scan(&[], f32::INFINITY, |v, b| v < b), (0, f32::INFINITY));
+    assert_eq!(lane_scan(&[f32::NAN; 20], f32::INFINITY, |v, b| v < b).0, 0);
+}
+
+#[test]
+fn centroid_norms_exist_only_for_gemm_l2() {
+    let centroids = [1.0f32, 2.0, 3.0, 4.0];
+    assert_eq!(centroid_norms(Kernel::Gemm, Metric::L2, &centroids, 2), [5.0, 25.0]);
+    assert!(centroid_norms(Kernel::Gemm, Metric::InnerProduct, &centroids, 2).is_empty());
+    assert!(centroid_norms(Kernel::Direct, Metric::L2, &centroids, 2).is_empty());
+    assert!(centroid_norms(Kernel::Direct, Metric::InnerProduct, &centroids, 2).is_empty());
+}
+
+#[test]
+#[should_panic(expected = "norms are not one per centroid")]
+fn gemm_l2_rejects_missing_norms() {
+    let (mut labels, mut scores) = ([0u32], [0.0f32]);
+    nearest(
+        Kernel::Gemm,
+        Metric::L2,
+        &[1.0, 0.0],
+        &[1.0, 0.0, 0.0, 1.0],
+        &[],
+        2,
+        &mut labels,
+        &mut scores,
+    );
 }

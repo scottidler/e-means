@@ -94,6 +94,7 @@ fn closing_mean_four_point_fixture() {
         Metric::L2,
         &x,
         model.centroids(),
+        &[],
         1,
         &mut labels,
         &mut distances,

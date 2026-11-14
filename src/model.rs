@@ -119,6 +119,7 @@ impl Model {
         let n = rows.len() / self.d;
         let mut labels = vec![0; n];
         let mut distances = vec![0.0; n];
+        let norms = assign::centroid_norms(self.kernel, self.metric, &self.centroids, self.d);
         // One block per task on the current `rayon` pool; each row's result depends only on the row.
         rows.par_chunks(BLOCK_ROWS * self.d)
             .zip(labels.par_chunks_mut(BLOCK_ROWS))
@@ -129,6 +130,7 @@ impl Model {
                     self.metric,
                     block,
                     &self.centroids,
+                    &norms,
                     self.d,
                     block_labels,
                     block_distances,

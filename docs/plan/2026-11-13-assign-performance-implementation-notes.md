@@ -31,3 +31,27 @@
 - Oracle mutation, run once and restored: `<` to `<=` in `oracle_direct_l2` (line 300) or in `oracle_gemm_nearest`'s L2 scan (line 356) fails `tie_between_two_centroids_in_one_lane_goes_to_the_lower`, `tie_between_two_lanes_goes_to_the_lower` and `tie_in_the_tail_goes_to_the_lower`.
 - `examples/large-k.rs`, 64 threads, 3 runs: `train` 4.242, 4.370, 4.495 s; peak RSS 2201148, 2201444, 2200412 KB; digest `440bf89bb2f83d80`. 1 thread (`taskset -c 2`): `train` 25.501 s, 158964 KB, same digest.
 - `otto h2h` exit 1 (all 10 gated cells miss): train d=32 1.648x / 2.031x / 1.554x (1t / 8t / 64t); assign d=32 1.808x (1t), 2.900x (64t); train d=8 default 4.408x / 5.844x / 2.243x; assign d=8 default 4.442x (1t), 4.549x (64t); 8 `always_gemm` cells `n/a`. Full table in the design doc, Phase 1.
+
+## Phase 2: Lane argmin and norms once per call
+
+### Design decisions
+- `lane_scan(scores, worst, better)` in `src/assign.rs`: one generic scan for both metrics (`<` with `+inf` for L2, `>` with `-inf` for inner product), so the tie rule lives in one place. Ids are `u32` (labels are `u32`); `LANES = 16` is a module const. The doc's `v < INF` guard is `v != worst` here: the same guard for L2, mirrored for IP.
+- Pass 1 is in place: `gemm_nearest` overwrites each tile row's inner products with the clamped L2 score (`row_norm + centroid_norm - 2.0 * ip`, then `< 0.0 -> 0.0`), so there is no second buffer. Same expression and operand order as the oracle.
+- `centroid_norms(kernel, metric, centroids, d)` in `src/assign.rs` returns `||c||^2` for Gemm + L2 and an empty `Vec` otherwise. `Model::assign` and `Trainer::assign_blocks` call it once before their parallel region (the trainer from `snapshot`) and share `&norms` across tasks. `nearest` asserts `norms.len() == k` for Gemm + L2, so a missing slice fails loudly instead of scoring against zero norms.
+- `scores.as_chunks::<LANES>()` instead of `chunks_exact(LANES)`: clippy (`chunks_exact_to_as_chunks`, `-D warnings`) requires it for a constant chunk size.
+- New tests: `lane_scan_equals_a_sequential_scan_bitwise_on_tie_heavy_data` (lengths 0..=70 and 255-257, four-valued data, NaN, all-`+inf`, all-`-inf`, both orders), `lane_scan_of_nothing_is_id_zero_at_the_identity`, `centroid_norms_exist_only_for_gemm_l2`, `gemm_l2_rejects_missing_norms`. The Phase 1 oracle and tie tests are unchanged except for the new `norms` argument.
+
+### Deviations
+- `nearest` carries `#[allow(clippy::too_many_arguments)]`: 8 parameters against clippy's limit of 7, and the doc's final signature has 9 with scratch. The doc does not mention the lint; the allow follows the doc's own seam and its comment says Phase 3 adds the scratch.
+- `cargo test oracle` matches only 2 tests by name (substring filter). The tie-fixture and golden-digest tests that exercise the oracles do not carry "oracle" in their names; all of them ran under `otto ci` and `cargo test --lib`.
+
+### Tradeoffs
+- In-place pass 1 vs a separate score buffer: no extra allocation, and the tile's inner products are dead after pass 1.
+- One generic `lane_scan` with a closure vs two hand-written scans: the closure inlines, and one function cannot drift between metrics.
+
+### Open questions
+- None.
+
+#### Recorded observations
+- Mutation, run once and restored: lane-merge tiebreak `lane_id[l] < best_id` changed to `>` fails `tie_between_two_lanes_goes_to_the_lower`, `a_row_equal_to_every_centroid_takes_index_zero_with_a_positive_zero_score` and `lane_scan_equals_a_sequential_scan_bitwise_on_tie_heavy_data`.
+- `cargo test --test parity`: 11 passed, `determinism_across_thread_counts_and_chunkings` ok (the Direct golden digests included). `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`. No `target_feature`, no `mul_add`.

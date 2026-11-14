@@ -40,15 +40,31 @@ pub(crate) enum Metric {
     InnerProduct,
 }
 
+/// Lanes of the argmin scan: a row's scores are scanned as 16 interleaved streams, which the compiler
+/// vectorizes on the baseline target.
+const LANES: usize = 16;
+
+/// The centroid squared norms `nearest` takes: `||c||^2` per centroid under `Kernel::Gemm` and `Metric::L2`,
+/// empty otherwise. Compute it once per top-level call and share it across that call's tasks.
+pub(crate) fn centroid_norms(kernel: Kernel, metric: Metric, centroids: &[f32], d: usize) -> Vec<f32> {
+    match (kernel, metric) {
+        (Kernel::Gemm, Metric::L2) => centroids.chunks_exact(d).map(|c| inner_product(c, c)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Label each row of `rows` with its nearest centroid under `metric` and record its score.
 ///
 /// `rows` is `labels.len()` rows of `d` coordinates; `centroids` is row-major with `d` columns. The score
-/// is the squared distance under `Metric::L2` and the inner product under `Metric::InnerProduct`.
+/// is the squared distance under `Metric::L2` and the inner product under `Metric::InnerProduct`. `norms`
+/// is `centroid_norms(kernel, metric, centroids, d)`, hoisted so a call computes it once, not per block.
+#[allow(clippy::too_many_arguments)] // the design's signature; the per-task scratch joins it in Phase 3
 pub(crate) fn nearest(
     kernel: Kernel,
     metric: Metric,
     rows: &[f32],
     centroids: &[f32],
+    norms: &[f32],
     d: usize,
     labels: &mut [u32],
     scores: &mut [f32],
@@ -67,17 +83,28 @@ pub(crate) fn nearest(
         !centroids.is_empty() && centroids.len().is_multiple_of(d),
         "centroids are not k rows of d"
     );
+    if kernel == Kernel::Gemm && metric == Metric::L2 {
+        assert_eq!(norms.len(), centroids.len() / d, "norms are not one per centroid");
+    }
     match (kernel, metric) {
         (Kernel::Direct, Metric::L2) => direct_l2(rows, centroids, d, labels, scores),
         (Kernel::Direct, Metric::InnerProduct) => direct_inner_product(rows, centroids, d, labels, scores),
-        (Kernel::Gemm, metric) => gemm_nearest(metric, rows, centroids, d, labels, scores),
+        (Kernel::Gemm, metric) => gemm_nearest(metric, rows, centroids, norms, d, labels, scores),
     }
 }
 
 /// The Gemm kernel over one block: a `rows x k` tile of inner products (the kernel's only scratch), then
-/// a scan per row. Under `Metric::L2` the score is `||x||^2 + ||c||^2 - 2 x.c`, clamped at 0, in Faiss's
+/// a lane scan per row. Under `Metric::L2` the score is `||x||^2 + ||c||^2 - 2 x.c`, clamped at 0, in Faiss's
 /// order (`exhaustive_L2sqr_blas`); under `Metric::InnerProduct` it is the inner product.
-fn gemm_nearest(metric: Metric, rows: &[f32], centroids: &[f32], d: usize, labels: &mut [u32], scores: &mut [f32]) {
+fn gemm_nearest(
+    metric: Metric,
+    rows: &[f32],
+    centroids: &[f32],
+    norms: &[f32],
+    d: usize,
+    labels: &mut [u32],
+    scores: &mut [f32],
+) {
     if labels.is_empty() {
         return;
     }
@@ -86,44 +113,67 @@ fn gemm_nearest(metric: Metric, rows: &[f32], centroids: &[f32], d: usize, label
     inner_products(rows, centroids, d, &mut tile);
     let per_row = rows
         .chunks_exact(d)
-        .zip(tile.chunks_exact(k))
+        .zip(tile.chunks_exact_mut(k))
         .zip(labels.iter_mut().zip(scores.iter_mut()));
     match metric {
         Metric::L2 => {
-            let centroid_norms: Vec<f32> = centroids.chunks_exact(d).map(|c| inner_product(c, c)).collect();
             for ((row, products), (label, distance)) in per_row {
                 let row_norm = inner_product(row, row);
-                let mut best = 0usize;
-                let mut best_distance = f32::INFINITY;
-                for (j, (&ip, &centroid_norm)) in products.iter().zip(&centroid_norms).enumerate() {
-                    let mut expanded = row_norm + centroid_norm - 2.0 * ip;
+                for (product, &centroid_norm) in products.iter_mut().zip(norms) {
+                    let mut expanded = row_norm + centroid_norm - 2.0 * *product;
                     if expanded < 0.0 {
                         expanded = 0.0;
                     }
-                    if expanded < best_distance {
-                        best = j;
-                        best_distance = expanded;
-                    }
+                    *product = expanded;
                 }
-                *label = best as u32;
-                *distance = best_distance;
+                (*label, *distance) = lane_scan(products, f32::INFINITY, |v, best| v < best);
             }
         }
         Metric::InnerProduct => {
             for ((_, products), (label, product)) in per_row {
-                let mut best = 0usize;
-                let mut best_product = f32::NEG_INFINITY;
-                for (j, &ip) in products.iter().enumerate() {
-                    if ip > best_product {
-                        best = j;
-                        best_product = ip;
-                    }
-                }
-                *label = best as u32;
-                *product = best_product;
+                (*label, *product) = lane_scan(products, f32::NEG_INFINITY, |v, best| v > best);
             }
         }
     }
+}
+
+/// The first index of the best score in `scores`, and that score, where `better(v, best)` is the strict
+/// order (`<` for the smallest, `>` for the largest) and `worst` is its identity (`+inf`, `-inf`).
+///
+/// Lane `l` scans ids `l, l + LANES, ..` with the strict order, so it keeps its lowest id at its best.
+/// Lanes merge in lane order, an equal score going to the lower id; the tail past the last full group has
+/// ids above every lane's, so it takes the strict order alone. That is the first index at the best score,
+/// as a sequential strict scan finds. A NaN loses every comparison, and a row of all `worst` takes id 0
+/// with score `worst`, on both paths (the `v != worst` guard).
+fn lane_scan(scores: &[f32], worst: f32, better: impl Fn(f32, f32) -> bool + Copy) -> (u32, f32) {
+    let mut lane_best = [worst; LANES];
+    let mut lane_id = [0u32; LANES];
+    let (groups, tail) = scores.as_chunks::<LANES>();
+    let mut base = 0u32;
+    for group in groups.iter() {
+        for l in 0..LANES {
+            if better(group[l], lane_best[l]) {
+                lane_best[l] = group[l];
+                lane_id[l] = base + l as u32;
+            }
+        }
+        base += LANES as u32;
+    }
+    let (mut best, mut best_id) = (worst, 0u32);
+    for l in 0..LANES {
+        let v = lane_best[l];
+        if better(v, best) || (v == best && v != worst && lane_id[l] < best_id) {
+            best = v;
+            best_id = lane_id[l];
+        }
+    }
+    for (offset, &v) in tail.iter().enumerate() {
+        if better(v, best) {
+            best = v;
+            best_id = base + offset as u32;
+        }
+    }
+    (best_id, best)
 }
 
 /// `tile[i * k + j] = rows[i] . centroids[j]` for the `m` rows and `k` centroids of `d` columns, both

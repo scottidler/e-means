@@ -143,6 +143,7 @@ fn assign_over_many_blocks_is_thread_count_invariant() {
         Metric::L2,
         &rows,
         model.centroids(),
+        &[],
         2,
         &mut serial_labels,
         &mut serial_distances,

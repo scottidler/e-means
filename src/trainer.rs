@@ -491,8 +491,9 @@ impl Trainer {
             free_scores = rest_scores;
         }
         let (kernel, metric, snapshot) = (self.kernel, self.metric, &self.snapshot);
+        let norms = assign::centroid_norms(kernel, metric, snapshot, d);
         jobs.into_par_iter().for_each(|(block, block_labels, block_scores)| {
-            assign::nearest(kernel, metric, block, snapshot, d, block_labels, block_scores);
+            assign::nearest(kernel, metric, block, snapshot, &norms, d, block_labels, block_scores);
         });
 
         let mut at = 0;
