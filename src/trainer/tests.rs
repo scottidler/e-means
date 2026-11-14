@@ -920,3 +920,188 @@ fn current_centroids_track_updates_in_both_modes() {
         "spherical: the refreshed readout"
     );
 }
+
+impl Trainer {
+    /// `Trainer::reduce` as of `3564435`, before the cluster partition (change 5), kept verbatim as the
+    /// oracle: one thread, row order.
+    fn oracle_reduce<'a>(&mut self, blocks: impl IntoIterator<Item = &'a [f32]>, labels: &[u32], scores: &[f32]) {
+        let d = self.d;
+        let mut at = 0;
+        for block in blocks {
+            let rows = block.len() / d;
+            if self.metric == Metric::InnerProduct {
+                // `2 - 2 * ip` per row, as `2 * rows` per block plus the f32 values `-2 * ip`
+                // (`REF/e_means.py:432-434`).
+                self.batch.objective += 2.0 * rows as f64;
+            }
+            for ((row, &label), &score) in block
+                .chunks_exact(d)
+                .zip(&labels[at..at + rows])
+                .zip(&scores[at..at + rows])
+            {
+                let j = label as usize;
+                self.batch.counts[j] += 1;
+                for (s, &x) in self.batch.sums[j * d..(j + 1) * d].iter_mut().zip(row) {
+                    *s += f64::from(x);
+                }
+                self.batch.objective += match self.metric {
+                    Metric::L2 => f64::from(score),
+                    Metric::InnerProduct => f64::from(-2.0 * score),
+                };
+            }
+            at += rows;
+        }
+        debug_assert_eq!(at, labels.len(), "every label belongs to a block row");
+        if let Some(pass_labels) = self.pass_labels.as_mut() {
+            pass_labels.extend_from_slice(labels);
+        }
+        self.batch.assigned += labels.len();
+    }
+}
+
+/// Clusters that receive only the three cancellation rows `2^60`, `-2^60`, `1` (column 0), from a start of
+/// 0.5: row order gives 1, a zero-started partial merged at the end gives 1.5. Owner boundaries at k = 100
+/// for 2, 7 and 64 owners fall at or next to these.
+const CANCEL_CLUSTERS: [u32; 6] = [0, 1, 14, 49, 50, 99];
+
+/// One reduction input: a carry block of `BLOCK_ROWS` rows from its own buffer (as `accumulate` builds it),
+/// then `rest` cut into `BLOCK_ROWS`-row blocks with a short final block; labels, scores, metric.
+struct ReduceCase {
+    d: usize,
+    k: usize,
+    metric: Metric,
+    carry: Vec<f32>,
+    rest: Vec<f32>,
+    labels: Vec<u32>,
+    scores: Vec<f32>,
+}
+
+impl ReduceCase {
+    fn new(metric: Metric, d: usize, rows: usize, seed: u64) -> Self {
+        let k = 100;
+        assert!(rows > BLOCK_ROWS && !(rows - BLOCK_ROWS).is_multiple_of(BLOCK_ROWS));
+        let mut x = lcg_values(rows * d, seed, 3.0);
+        let mut labels: Vec<u32> = lcg_values(rows, seed + 1, 1.0)
+            .iter()
+            .map(|v| ((v + 1.0) * 0.5 * k as f32) as u32 % k as u32)
+            .map(|j| if CANCEL_CLUSTERS.contains(&j) { j.saturating_sub(2).max(2) } else { j })
+            .collect();
+        let scores = lcg_values(rows, seed + 2, 1.0)
+            .iter()
+            .map(|v| if metric == Metric::L2 { v.abs() * 7.0 } else { *v })
+            .collect();
+        // 2^60 in the carry block, -2^60 in a middle block, 1 in the short final block.
+        for (n, &j) in CANCEL_CLUSTERS.iter().enumerate() {
+            for (row, value) in [
+                (7 + n, 2f32.powi(60)),
+                (BLOCK_ROWS + 3 + n, -(2f32.powi(60))),
+                (rows - 1 - n, 1.0),
+            ] {
+                labels[row] = j;
+                x[row * d] = value;
+            }
+        }
+        let rest = x.split_off(BLOCK_ROWS * d);
+        ReduceCase {
+            d,
+            k,
+            metric,
+            carry: x,
+            rest,
+            labels,
+            scores,
+        }
+    }
+
+    fn blocks(&self) -> Vec<&[f32]> {
+        std::iter::once(&self.carry[..])
+            .chain(self.rest.chunks(BLOCK_ROWS * self.d))
+            .collect()
+    }
+
+    /// A last-pass trainer capturing labels, with nonzero starting counts, sums and objective.
+    fn trainer(&self) -> Trainer {
+        let (d, k) = (self.d, self.k);
+        let init = lcg_values(k * d, 5, 1.0);
+        let mut trainer = EMeans::new(d, k)
+            .epochs(1.0)
+            .batch_size(self.labels.len() + 10)
+            .spherical(self.metric == Metric::InnerProduct)
+            .begin(self.labels.len() + 10, &init)
+            .unwrap();
+        assert!(trainer.pass_labels.is_some(), "the fixture captures labels");
+        trainer.pass_labels.as_mut().unwrap().extend([3, 1, 4]);
+        for (j, count) in trainer.batch.counts.iter_mut().enumerate() {
+            *count = j as u64 % 5 + 1;
+        }
+        for (s, v) in trainer.batch.sums.iter_mut().zip(lcg_values(k * d, 9, 1e3)) {
+            *s = f64::from(v) / 7.0;
+        }
+        for &j in &CANCEL_CLUSTERS {
+            trainer.batch.sums[j as usize * d] = 0.5;
+        }
+        trainer.batch.objective = 12.345;
+        trainer.batch.assigned = 3;
+        trainer
+    }
+
+    fn oracle(&self) -> Trainer {
+        let mut oracle = self.trainer();
+        oracle.oracle_reduce(self.blocks(), &self.labels, &self.scores);
+        for &j in &CANCEL_CLUSTERS {
+            assert_eq!(oracle.batch.sums[j as usize * self.d], 1.0, "row order cancels to 1");
+        }
+        oracle
+    }
+}
+
+fn assert_same_reduction(got: &Trainer, want: &Trainer, context: &str) {
+    let sum_bits = |t: &Trainer| t.batch.sums.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+    assert_eq!(got.batch.counts, want.batch.counts, "counts, {context}");
+    assert_eq!(sum_bits(got), sum_bits(want), "sums, {context}");
+    assert_eq!(
+        got.batch.objective.to_bits(),
+        want.batch.objective.to_bits(),
+        "objective, {context}"
+    );
+    assert_eq!(got.pass_labels, want.pass_labels, "captured labels, {context}");
+    assert_eq!(got.batch.assigned, want.batch.assigned, "assigned, {context}");
+}
+
+// Change 5: partitioning the reduction by cluster moves no bit at any owner count.
+#[test]
+fn partitioned_reduce_matches_the_oracle_bitwise() {
+    for metric in [Metric::L2, Metric::InnerProduct] {
+        for (d, rows) in [(3, 3 * BLOCK_ROWS + 37), (8, 2 * BLOCK_ROWS + 1)] {
+            let case = ReduceCase::new(metric, d, rows, 21 + d as u64);
+            let want = case.oracle();
+            for owners in [1, 2, 7, 64] {
+                let mut got = case.trainer();
+                got.reduce_partitioned(&case.blocks(), &case.labels, &case.scores, owners);
+                assert_same_reduction(&got, &want, &format!("{metric:?} d={d} rows={rows} owners={owners}"));
+            }
+        }
+    }
+}
+
+// The dispatch: a batch below `PARALLEL_REDUCE_VALUES` reduces serially, one at or above it in parallel;
+// both equal the oracle, in a 1-thread and an 8-thread pool.
+#[test]
+fn reduce_on_both_sides_of_the_parallel_threshold_matches_the_oracle() {
+    let d = 8;
+    let small = 3 * BLOCK_ROWS + 37;
+    let large = PARALLEL_REDUCE_VALUES / d + BLOCK_ROWS + 37;
+    assert!(small * d < PARALLEL_REDUCE_VALUES && large * d >= PARALLEL_REDUCE_VALUES);
+    for threads in [1, 8] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        for metric in [Metric::L2, Metric::InnerProduct] {
+            for rows in [small, large] {
+                let case = ReduceCase::new(metric, d, rows, 40 + rows as u64);
+                let want = case.oracle();
+                let mut got = case.trainer();
+                pool.install(|| got.reduce(&case.blocks(), &case.labels, &case.scores));
+                assert_same_reduction(&got, &want, &format!("{metric:?} rows={rows} threads={threads}"));
+            }
+        }
+    }
+}

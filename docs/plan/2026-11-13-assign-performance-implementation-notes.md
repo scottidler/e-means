@@ -112,3 +112,31 @@
 - `otto ci` exit 0, `All CI checks passed!`; 141 lib tests, 11 parity (determinism and golden digests ok), 4 quality, 1 doctest. `rg -n 'gather_into' src/config.rs` prints nothing (exit 1). `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`.
 - `otto bench` before / after: `train/n100000_d32_k256_t5` 41.879 -> 29.230 ms; `train/n100000_d8_k256_t5` 97.075 -> 95.025 ms; `Model::assign` benches 7-59% faster (the serial finite scan left the critical path). Full tables in the design doc, Phase 4.
 - `otto h2h` after: every d=32 cell passes (train 1.089 / 1.155 / 1.078 at 1 / 8 / 64 threads; assign 1.097 at 1 thread, 1.237 at 64); the 5 d=8 default cells still miss (Direct is Phase 6). `assign-d8-default-1t` printed 52.03 ms in the full run, which is a load mode: interleaved re-runs gave 44.2 ms for both `684cfe0` and this phase.
+
+## Phase 5: Cluster-partitioned reduction
+
+### Design decisions
+- `Trainer::reduce(blocks, labels, scores)` (`src/trainer.rs`) is now a dispatch: `labels.len() * d >= PARALLEL_REDUCE_VALUES` -> `rayon::current_num_threads()` owners, else 1. The work is in `Trainer::reduce_partitioned(.., owners)`, which the oracle test drives at fixed owner counts.
+- Owners split `self.batch.counts` / `self.batch.sums` with `split_at_mut` into disjoint contiguous slices and add in place (`add_owned_rows`, a free fn): every owner walks all blocks in their order (the carry block first when there is one) and every label in row order, skipping rows outside its range with one `wrapping_sub` + bounds compare. No partial is ever zero-started and merged.
+- One owner (serial path) calls the same `add_owned_rows` over the whole range, so the serial and parallel paths share one add loop.
+- The objective (with the spherical `2 * rows` per block ahead of its scores and the f32 `-2.0 * score`), `pass_labels` and `batch.assigned` run on the calling thread, in row order, after the owners' region joins. `apply` only runs later in `update`.
+- `reduce` takes `&[&[f32]]` instead of an iterator: each owner walks the blocks, so they must be re-walkable and shared. `accumulate_indexed` collects its `gathered.chunks(..)` (at most 32 slices per batch); `assign_blocks` already had the slice.
+- `PARALLEL_REDUCE_VALUES = 1 << 16`, a `pub(crate)` const next to `BLOCK_ROWS`, with the measured reason in its doc comment.
+- `oracle_reduce`: `3564435`'s `Trainer::reduce` verbatim, as an `impl Trainer` block in `src/trainer/tests.rs`. Tests `partitioned_reduce_matches_the_oracle_bitwise` (owners 1, 2, 7, 64) and `reduce_on_both_sides_of_the_parallel_threshold_matches_the_oracle` (dispatch in 1- and 8-thread pools, below and above the threshold). Fixture `ReduceCase`: k=100, a carry block from its own buffer, middle blocks, a short final block, nonzero starting counts/sums/objective/`assigned`/captured labels, both metrics, and six clusters (0, 1, 14, 49, 50, 99: at or next to owner boundaries) that receive only the rows 2^60, -2^60, 1 in column 0 from a start of 0.5. The fixture asserts the oracle lands on 1.0 there, so the cancellation is real.
+
+### Deviations
+- Owner ranges are `owner * k / owners` boundaries (sizes differ by at most one) instead of "`k / P` each, the last takes the remainder". Same bits (each cluster still has one owner walking in row order); avoids one owner taking 37 of 100 clusters at P=64. Owners are clamped to `1..=k`, so k < P never leaves empty owners.
+- The serial path is two passes over the labels (adds, then the objective) instead of today's one fused loop. Bits are unchanged (independent accumulators, each in row order); the d=8 bench, which takes this path, did not regress.
+
+### Tradeoffs
+- `PARALLEL_REDUCE_VALUES = 1 << 16` vs the edges of the passing window (8193..=262144 at these two benches): the window's ends are pinned by one bench each, and the break-even between them was not measured, so the value sits inside it with margin on both sides rather than at an edge.
+- P = thread count vs fewer owners: P owners read P x rows labels. At 64 threads and d=32 that still won ~11%; no other P was tried, per the doc's partition policy.
+- Collecting block slices into a `Vec` per batch vs a `Clone + Sync` iterator bound: one small allocation per batch, simpler signature.
+
+### Open questions
+- None.
+
+#### Recorded observations
+- Mutations, run once and restored, each failing both oracle tests: (a) an owner adding into a zero-started partial merged at the end: `sums, L2 d=3 rows=805 owners=2`; re-run with every random starting sum zeroed so only the cancellation clusters' 0.5 starts remain: `sums[0] (cluster 0) got 1.5 want 1`. (b) an owner walking the blocks in reverse: `sums, L2 d=3 rows=805 owners=2` and `sums, L2 rows=8485 threads=8`.
+- Bench, `3564435` re-measured interleaved with this phase, two rounds (load 13.9-25.7): d=32 27.971, 27.643 -> 24.799, 24.806 ms; d=8 84.168, 88.278 -> 82.543, 87.108 ms. Threshold probe at `1 << 13`: d=8 199.39, 196.89 ms (2.1x worse), so d=8 must stay serial. Full table in the design doc, Phase 5.
+- `otto ci` exit 0, `All CI checks passed!`; 143 lib tests, 11 parity (determinism and golden digests ok), 4 quality, 1 doctest. `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`.
