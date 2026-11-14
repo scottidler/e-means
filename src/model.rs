@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use crate::assign::{self, Kernel, Metric};
 use crate::error::{Error, Result};
 use crate::recipe::Recipe;
-use crate::trainer::BLOCK_ROWS;
+use crate::trainer::{BLOCK_ROWS, task_rows};
 
 /// Statistics of one pass, recorded by `Trainer::end_epoch`.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,32 +115,31 @@ impl Model {
         let mut distances = vec![0.0; n];
         let norms = assign::centroid_norms(self.kernel, self.metric, &self.centroids, self.d);
         let first_bad = AtomicUsize::new(usize::MAX);
-        // One block per task on the current `rayon` pool; each row's result depends only on the row. Each task
-        // scans its block for NaN/inf first and skips it on a hit; the error names the lowest offending value.
-        rows.par_chunks(BLOCK_ROWS * self.d)
-            .zip(labels.par_chunks_mut(BLOCK_ROWS))
-            .zip(distances.par_chunks_mut(BLOCK_ROWS))
+        // One task per block, or per `task_rows` piece of one, on the current `rayon` pool; each row's result
+        // depends only on the row. Each task scans its rows for NaN/inf first and skips them on a hit; the error
+        // names the lowest offending value.
+        let task = task_rows(n.div_ceil(BLOCK_ROWS), rayon::current_num_threads());
+        rows.par_chunks(task * self.d)
+            .zip(labels.par_chunks_mut(task))
+            .zip(distances.par_chunks_mut(task))
             .enumerate()
-            .for_each_init(
-                Vec::new,
-                |scratch, (index, ((block, block_labels), block_distances))| {
-                    if let Some(at) = block.iter().position(|v| !v.is_finite()) {
-                        first_bad.fetch_min(index * BLOCK_ROWS * self.d + at, Ordering::Relaxed);
-                        return;
-                    }
-                    assign::nearest(
-                        self.kernel,
-                        self.metric,
-                        block,
-                        &self.centroids,
-                        &norms,
-                        self.d,
-                        block_labels,
-                        block_distances,
-                        scratch,
-                    );
-                },
-            );
+            .for_each_init(Vec::new, |scratch, (index, ((piece, task_labels), task_distances))| {
+                if let Some(at) = piece.iter().position(|v| !v.is_finite()) {
+                    first_bad.fetch_min(index * task * self.d + at, Ordering::Relaxed);
+                    return;
+                }
+                assign::nearest(
+                    self.kernel,
+                    self.metric,
+                    piece,
+                    &self.centroids,
+                    &norms,
+                    self.d,
+                    task_labels,
+                    task_distances,
+                    scratch,
+                );
+            });
         let at = first_bad.into_inner();
         if at != usize::MAX {
             return Err(Error::NonFiniteInput(format!(

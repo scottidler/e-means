@@ -241,18 +241,10 @@ impl EMeans {
             }
         };
         let mut trainer = self.begin(n, init)?;
-        let batch = trainer.batch_rows();
-        let passes = trainer.recipe().epoch_rows.clone();
-        let mut last_order = Vec::new();
-        for (pass, &pass_rows) in passes.iter().enumerate() {
-            let order = Stream::new(self.seed, StreamId::Pass(pass as u64)).permutation(n);
-            for ids in order[..pass_rows].chunks(batch) {
-                trainer.accumulate_indexed(x, ids)?;
-                trainer.update()?;
-            }
-            trainer.end_epoch()?;
-            last_order = order;
-        }
+        let seed = self.seed;
+        // On a pool thread, so each batch's region forks from a worker instead of being handed over from the
+        // caller; inside a caller's pool it runs on the caller's worker.
+        let last_order = rayon::scope(|_| run_passes(&mut trainer, x, n, seed))?;
         let mut model = trainer.finalize()?;
         model.scatter_labels(&last_order, n);
         Ok(model)
@@ -273,6 +265,37 @@ impl EMeans {
         }
         Ok(())
     }
+}
+
+/// Every pass of `trainer` over the `n` rows of `x`, each in the order of its own seeded stream; returns the
+/// last pass's order.
+///
+/// Pass p+1's order is drawn alongside pass p's batches (`rayon::join`). It comes from its own stream, so it
+/// is the same permutation as drawing it after pass p; none is drawn after the last pass. An error in pass p
+/// returns once that draw finishes.
+fn run_passes(trainer: &mut Trainer, x: &[f32], n: usize, seed: u64) -> Result<Vec<usize>> {
+    let batch = trainer.batch_rows();
+    let passes = trainer.recipe().epoch_rows.clone();
+    debug!("run_passes: n={n} batch={batch} passes={}", passes.len());
+    let mut order = Stream::new(seed, StreamId::Pass(0)).permutation(n);
+    for (pass, &pass_rows) in passes.iter().enumerate() {
+        let (fed, next) = rayon::join(
+            || -> Result<()> {
+                for ids in order[..pass_rows].chunks(batch) {
+                    trainer.accumulate_indexed(x, ids)?;
+                    trainer.update()?;
+                }
+                Ok(())
+            },
+            || (pass + 1 < passes.len()).then(|| Stream::new(seed, StreamId::Pass(pass as u64 + 1)).permutation(n)),
+        );
+        fed?;
+        trainer.end_epoch()?;
+        if let Some(next) = next {
+            order = next;
+        }
+    }
+    Ok(order)
 }
 
 /// The rows `ids` of `x`, in that order.

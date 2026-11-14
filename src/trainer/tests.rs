@@ -1105,3 +1105,76 @@ fn reduce_on_both_sides_of_the_parallel_threshold_matches_the_oracle() {
         }
     }
 }
+
+/// Tasks a call runs over blocks of `block_rows` rows on `threads` threads: each block cut into
+/// `task_rows` pieces, as `accumulate_indexed`, `assign_blocks` and `Model::assign` cut them.
+fn tasks(block_rows: &[usize], threads: usize) -> usize {
+    let task = task_rows(block_rows.len(), threads);
+    block_rows.iter().map(|rows| rows.div_ceil(task)).sum()
+}
+
+// Change 7's split rule: 64-row tasks only when the call has fewer blocks than threads and the pool has at
+// most `SPLIT_MAX_THREADS`; blocks themselves stay 256 rows.
+#[test]
+fn split_rule_cuts_blocks_into_tasks_only_below_the_thread_count_and_cap() {
+    let full = |blocks: usize| vec![BLOCK_ROWS; blocks];
+    // (block rows, threads, tasks, why)
+    let cases = [
+        (full(4), 8, 16, "4 blocks at 8 threads split"),
+        (full(4), 64, 4, "above SPLIT_MAX_THREADS: no split"),
+        (full(32), 8, 32, "more blocks than threads: no split"),
+        (full(8), 8, 8, "blocks == threads: no split"),
+        (full(4), 32, 16, "at SPLIT_MAX_THREADS: split"),
+        (full(4), 33, 4, "one past SPLIT_MAX_THREADS: no split"),
+        (
+            vec![BLOCK_ROWS, 44],
+            8,
+            5,
+            "300 rows: the 256-row block as 4, the 44-row block as 1",
+        ),
+    ];
+    for (block_rows, threads, want, why) in cases {
+        assert_eq!(
+            tasks(&block_rows, threads),
+            want,
+            "{why}: {} blocks, {threads} threads",
+            block_rows.len()
+        );
+    }
+    assert_eq!(SPLIT_MAX_THREADS, 32);
+    assert_eq!(
+        task_rows(1, 1),
+        BLOCK_ROWS,
+        "one block on one thread: nothing to split for"
+    );
+    assert_eq!(task_rows(1, 2), TASK_ROWS);
+}
+
+// A multi-block caller chunk with a carry block assigns the same bits split (8-thread pool, 64-row tasks)
+// and unsplit (1 thread and 64 threads, one task per block).
+#[test]
+fn assign_blocks_split_into_tasks_matches_one_task_per_block() {
+    let (d, k, batch) = (8, 16, 1024);
+    let x = lcg_values(batch * d, 91, 3.0);
+    let init = lcg_values(k * d, 92, 3.0);
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        pool.install(|| {
+            let builder = EMeans::new(d, k).epochs(1.0).batch_size(batch).alpha0(0.2).seed(3);
+            let mut trainer = builder.begin(batch, &init).unwrap();
+            // 100 rows leave a carry; the next chunk completes it and cuts three more blocks.
+            trainer.accumulate(&x[..100 * d]).unwrap();
+            trainer.accumulate(&x[100 * d..]).unwrap();
+            (
+                trainer.batch.counts.clone(),
+                trainer.batch.sums.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                trainer.batch.objective.to_bits(),
+                trainer.block_labels.clone(),
+            )
+        })
+    };
+    let want = run(1);
+    for threads in [8, 64] {
+        assert_eq!(run(threads), want, "threads {threads}");
+    }
+}

@@ -97,8 +97,9 @@ fn assign_rejects_partial_and_non_finite_rows() {
     ));
 }
 
-// `Model::assign` scans each 256-row task for NaN/inf and keeps the minimum offending offset. 300 rows are
-// two tasks, the second short (44 rows); NaN at rows 5 and 290 names row 5, in 1- and 8-thread pools.
+// `Model::assign` scans each task for NaN/inf and keeps the minimum offending offset. 300 rows are two
+// blocks, the second short (44 rows): two tasks at 1 thread, five 64-row tasks at 8 (rows 5 and 290 in
+// the first and the short last); NaN at rows 5 and 290 names row 5 in both pools.
 #[test]
 fn assign_non_finite_rows_in_two_tasks_report_the_first_row() {
     let model = two_cluster_model();

@@ -24,12 +24,34 @@ use crate::spherical;
 /// never changes the result.
 pub(crate) const BLOCK_ROWS: usize = 256;
 
+/// Rows per rayon task when a call splits its 256-row blocks (`task_rows`). Divides `BLOCK_ROWS`, so a task
+/// never straddles a block.
+pub(crate) const TASK_ROWS: usize = 64;
+
+/// Largest pool that splits blocks into `TASK_ROWS` tasks. Above it more tasks cost more in wake-up and join
+/// than they save (measured on a 64-thread machine, S5 of `docs/plan/2026-11-13-assign-performance.md`).
+pub(crate) const SPLIT_MAX_THREADS: usize = 32;
+
+const _: () = assert!(BLOCK_ROWS.is_multiple_of(TASK_ROWS), "a task must not straddle a block");
+
 /// Batches of at least this many values (rows * d) reduce their counts and sums in a parallel region
 /// partitioned by cluster; smaller ones reduce on the calling thread. Each owner reads every label, so the
 /// split pays only when the per-row adds (d of them) outweigh P label reads. Measured at 64 threads (Phase 5
 /// of `docs/plan/2026-11-13-assign-performance.md`): the d=32 train batch (262144 values) gains ~11% in
 /// parallel, the d=8 batch (8192 values) doubles train time; any value in (8192, 262144] keeps both.
 pub(crate) const PARALLEL_REDUCE_VALUES: usize = 1 << 16;
+
+/// Rows per rayon task for a call of `blocks` blocks on a pool of `threads`: `TASK_ROWS` when the call has
+/// fewer blocks than threads and the pool has at most `SPLIT_MAX_THREADS`, else one task per block
+/// (`BLOCK_ROWS`). Each row's result depends only on the row and the centroids, so the split changes speed,
+/// never a bit; blocks, and the reduction over them, stay cut at `BLOCK_ROWS`.
+pub(crate) fn task_rows(blocks: usize, threads: usize) -> usize {
+    if blocks < threads && threads <= SPLIT_MAX_THREADS {
+        TASK_ROWS
+    } else {
+        BLOCK_ROWS
+    }
+}
 
 /// Statistics of one logical batch computed outside the trainer (`REF/base.py:249-255`).
 #[derive(Debug, Clone, Copy)]
@@ -475,8 +497,8 @@ impl Trainer {
     }
 
     /// Assign and add one whole batch of rows of `x` (row-major, `d` columns), given by `ids`, in one
-    /// parallel region: each task gathers its 256-row block into the batch buffer, scans it for NaN/inf,
-    /// and assigns it against the snapshot. `train` only; the caller-driven path is `accumulate`.
+    /// parallel region: each task gathers its rows (a 256-row block, or a `task_rows` piece of one) into the
+    /// batch buffer, scans them for NaN/inf, and assigns them against the snapshot. `train` only; the caller-driven path is `accumulate`.
     ///
     /// Bitwise equal to `accumulate` of the gathered rows: blocks are cut at 256 rows from the batch start,
     /// and both share `reduce`. On a NaN or infinite value the error names the
@@ -507,20 +529,21 @@ impl Trainer {
         let first_bad = AtomicUsize::new(usize::MAX);
         let (kernel, metric, snapshot) = (self.kernel, self.metric, &self.snapshot);
         let norms = assign::centroid_norms(kernel, metric, snapshot, d);
+        let task = task_rows(due.div_ceil(BLOCK_ROWS), rayon::current_num_threads());
         gathered
-            .par_chunks_mut(BLOCK_ROWS * d)
-            .zip(ids.par_chunks(BLOCK_ROWS))
-            .zip(labels.par_chunks_mut(BLOCK_ROWS))
-            .zip(scores.par_chunks_mut(BLOCK_ROWS))
+            .par_chunks_mut(task * d)
+            .zip(ids.par_chunks(task))
+            .zip(labels.par_chunks_mut(task))
+            .zip(scores.par_chunks_mut(task))
             .enumerate()
             .for_each_init(
                 Vec::new,
-                |scratch, (block, (((rows, block_ids), block_labels), block_scores))| {
-                    for (row, &i) in rows.chunks_exact_mut(d).zip(block_ids) {
+                |scratch, (index, (((rows, task_ids), task_labels), task_scores))| {
+                    for (row, &i) in rows.chunks_exact_mut(d).zip(task_ids) {
                         row.copy_from_slice(&x[i * d..(i + 1) * d]);
                     }
                     if let Some(at) = rows.iter().position(|v| !v.is_finite()) {
-                        first_bad.fetch_min(block * BLOCK_ROWS * d + at, Ordering::Relaxed);
+                        first_bad.fetch_min(index * task * d + at, Ordering::Relaxed);
                         return;
                     }
                     assign::nearest(
@@ -530,8 +553,8 @@ impl Trainer {
                         snapshot,
                         &norms,
                         d,
-                        block_labels,
-                        block_scores,
+                        task_labels,
+                        task_scores,
                         scratch,
                     );
                 },
@@ -556,8 +579,8 @@ impl Trainer {
         result
     }
 
-    /// Assign complete blocks against the snapshot, one block per task on the current `rayon` pool, then add
-    /// them to the batch with `reduce`.
+    /// Assign complete blocks against the snapshot on the current `rayon` pool, one task per block or per
+    /// `task_rows` piece of one, then add them to the batch with `reduce`.
     ///
     /// A block's labels and scores depend only on its rows and the snapshot, and each cluster's sums and the
     /// objective are added in row order, so neither the thread count nor how the rows arrived changes a bit
@@ -574,29 +597,32 @@ impl Trainer {
         labels.resize(total, 0);
         scores.resize(total, 0.0);
 
-        let mut jobs = Vec::with_capacity(blocks.len());
+        let task = task_rows(blocks.len(), rayon::current_num_threads());
+        let mut jobs = Vec::with_capacity(total.div_ceil(task) + blocks.len());
         let (mut free_labels, mut free_scores) = (&mut labels[..], &mut scores[..]);
         for &block in blocks {
-            let rows = block.len() / d;
-            let (block_labels, rest_labels) = std::mem::take(&mut free_labels).split_at_mut(rows);
-            let (block_scores, rest_scores) = std::mem::take(&mut free_scores).split_at_mut(rows);
-            jobs.push((block, block_labels, block_scores));
-            free_labels = rest_labels;
-            free_scores = rest_scores;
+            for rows in block.chunks(task * d) {
+                let len = rows.len() / d;
+                let (task_labels, rest_labels) = std::mem::take(&mut free_labels).split_at_mut(len);
+                let (task_scores, rest_scores) = std::mem::take(&mut free_scores).split_at_mut(len);
+                jobs.push((rows, task_labels, task_scores));
+                free_labels = rest_labels;
+                free_scores = rest_scores;
+            }
         }
         let (kernel, metric, snapshot) = (self.kernel, self.metric, &self.snapshot);
         let norms = assign::centroid_norms(kernel, metric, snapshot, d);
         jobs.into_par_iter()
-            .for_each_init(Vec::new, |scratch, (block, block_labels, block_scores)| {
+            .for_each_init(Vec::new, |scratch, (rows, task_labels, task_scores)| {
                 assign::nearest(
                     kernel,
                     metric,
-                    block,
+                    rows,
                     snapshot,
                     &norms,
                     d,
-                    block_labels,
-                    block_scores,
+                    task_labels,
+                    task_scores,
                     scratch,
                 );
             });

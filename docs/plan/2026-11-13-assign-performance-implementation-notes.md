@@ -168,3 +168,53 @@
 - `cargo bench --bench train -- n100000_d8`: 42.880 ms [42.206, 44.317] (Phase 5: 82.543, 87.108 ms).
 - Mutations, run once and restored: cross-tile merge on equal (`|| best == *score`) fails the three `tiled_lane_direct_*` tests; a lane keeping the later id on equal fails `tie_between_two_centroids_in_one_lane_goes_to_the_lower` and three more.
 - `otto ci` exit 0; 150 lib tests, 11 parity (determinism and golden digests ok), 4 quality, 1 doctest. `cargo test oracle`: 11 passed. `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`.
+
+## Phase 7: Task split, pool-thread loop, permutation overlap
+
+Status: implemented in the working tree on `d8b88b4`, `otto ci` green, NOT committed. The Phase 7 gate (`otto h2h --cell train-d8-default-8t`, bound 1.35) misses: 1.32-1.67 over 20 runs, median ~1.47.
+
+### Design decisions
+- `task_rows(blocks, threads)` (`src/trainer.rs`) is the one split rule: `TASK_ROWS` (64) when `blocks < threads && threads <= SPLIT_MAX_THREADS` (32), else `BLOCK_ROWS`. A `const` assert pins `BLOCK_ROWS % TASK_ROWS == 0`, so a task never straddles a block.
+- `accumulate_indexed` and `Model::assign` chunk the whole call at `task_rows(n.div_ceil(BLOCK_ROWS), current_num_threads())`. Blocks are cut at multiples of 256 from the start, so 64-row chunks land inside blocks; the reduction still walks `gathered.chunks(BLOCK_ROWS * d)`. The `fetch_min` offset is `index * task * d + at`.
+- `assign_blocks` cuts each block (carry block included) into `task`-row pieces with their own label/score slices; `reduce` still gets the 256-row blocks.
+- `run_passes` (`src/config.rs`) owns the pass loop: pass 0's order drawn up front, then per pass `rayon::join(batches of pass p, draw pass p+1 if any)`, `fed?` after the join, `end_epoch`. `train_rows` calls it inside `rayon::scope` and hands its returned last order to `scatter_labels`.
+- Tests: `split_rule_cuts_blocks_into_tasks_only_below_the_thread_count_and_cap` (the seven doc cases plus 1 block at 1 and 2 threads), `assign_blocks_split_into_tasks_matches_one_task_per_block` (carry block + 3 blocks, 1/8/64-thread pools, bitwise counts, sums, objective, labels). `train_matches_caller_loop_in_pools` pins the loop and the overlap; the Phase 4 NaN tests now cross 64-row tasks at 8 threads.
+
+### Deviations
+- None from the design. The gate criterion is not met (see Open questions).
+
+### Tradeoffs
+- Chunking the whole batch at `task` rows vs nesting a per-block split: same tasks (64 divides 256), one zip chain, no extra job list.
+- `run_passes` as a free function vs a closure inside `scope`: names the loop, keeps `train_rows` short, and is the seam the scratch instrumentation hooked.
+
+### Open questions
+- The 8t gate. Measured root cause (full numbers in the design doc, Phase 7): the S5 prototype itself measures 1.35-1.54 (median ~1.42) in `bin/h2h`, against 1.12-1.20 in its own harness the same hour. The S5 harness ran emeans from the main thread on the global pool, so emeans paid a per-region handoff (18.3-20.3 ms) that `bin/h2h`'s `pool.install` removes (12-16.5 ms). This build is within ~1 ms of the prototype's absolute time. What remains is the lane Direct kernel's per-row cost (parked non-goal), serial reduce + update (~2.2 ms) and region sync (~5 ms). Scott's call: rebound the 8t cell on `bin/h2h` evidence, or reopen the kernel non-goal.
+- `train-d8-default-1t` measured 1.617 and 1.613-1.618 (bound 1.6, Phase 9). Same code path as Phase 6 at 1 thread (no split, `join` inline); Phase 6 had 1.600-1.603.
+
+## Phase 7 (orchestrator addendum, 2026-11-14): gate resolution
+
+### Design decisions
+- Scott chose option A: reset the d=8 default bounds from `bin/h2h` measurements (`bin/h2h/src/main.rs` `GRID`): train-d8-default 1t 1.6 -> 1.75, 8t 1.35 -> 1.8; assign-d8-default 64t 1.6 -> 1.8. Recorded in the design doc's Acceptance Criteria and Resolved Decisions.
+
+### Deviations
+- Supersedes the "NOT COMMITTED" status above: Phase 7 is committed with the reset bounds. The criterion was a doc defect: the S5 prototype it came from misses 1.35 in `bin/h2h` (median ~1.42) because the S5 harness charged emeans a calling-thread-to-pool handoff `bin/h2h` does not.
+
+### Tradeoffs
+- Bounds at ~8% over the worst observed value vs. the median: the gate is a median of 15 pairs that still swung 1.32-1.67 over 20 runs, so a median-based bound would flake.
+
+### Open questions
+- None.
+
+## Phase 3 (orchestrator addendum, 2026-11-14)
+
+### Design decisions
+- `TILE_FLOATS = 1 << 18` kept by the doc's "faster at 64 threads" rule; the doc's Data Model and Resolved Decisions lines were updated to say so. 2^16's 1-thread (~11% faster) and memory (~35% lighter) edge was surfaced to Scott; no change requested.
+
+### Deviations
+- None.
+
+### Tradeoffs
+- None.
+
+### Open questions
+- None.

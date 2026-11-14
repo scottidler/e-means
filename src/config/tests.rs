@@ -254,8 +254,9 @@ fn train_matches_caller_loop_in_pools() {
     }
 }
 
-// `train`'s fused region scans each 256-row task for NaN/inf and keeps the minimum offending offset
-// (`fetch_min`). NaN at gathered positions 5 and 900 of the first batch land in blocks 0 and 3; the error
+// `train`'s fused region scans each task for NaN/inf and keeps the minimum offending offset (`fetch_min`).
+// NaN at gathered positions 5 and 900 of the first batch land in blocks 0 and 3 (64-row tasks 0 and 14 at
+// 8 threads); the error
 // names batch row 5, the message `accumulate` gives for the gathered batch, in 1- and 8-thread pools.
 #[test]
 fn train_non_finite_rows_in_two_tasks_report_the_first_batch_row() {

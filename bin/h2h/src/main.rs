@@ -75,14 +75,14 @@ const GRID: [Row; 6] = [
         op: Op::Train,
         d: 8,
         always_gemm: false,
-        bounds: [Some(1.6), Some(1.35), None, Some(1.3)],
+        bounds: [Some(1.75), Some(1.8), None, Some(1.3)],
     },
     Row {
         label: "assign-d8-default",
         op: Op::Assign,
         d: 8,
         always_gemm: false,
-        bounds: [Some(2.1), None, None, Some(1.6)],
+        bounds: [Some(2.1), None, None, Some(1.8)],
     },
     Row {
         label: "train-d8-gemm",
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(all.len(), GRID.len() * THREADS.len());
         assert!(
             all.iter()
-                .any(|c| c.name == "train-d8-default-8t" && c.bound == Some(1.35))
+                .any(|c| c.name == "train-d8-default-8t" && c.bound == Some(1.8))
         );
         assert!(all.iter().any(|c| c.name == "assign-d32-8t" && c.bound.is_none()));
         let mut names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
