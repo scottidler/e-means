@@ -419,6 +419,7 @@ fn non_finite_state_poisons_the_trainer() {
     assert_eq!(trainer.accumulate(&[0.0]), Err(Error::Poisoned));
     assert_eq!(trainer.update(), Err(Error::Poisoned));
     assert_eq!(trainer.end_epoch(), Err(Error::Poisoned));
+    assert_eq!(trainer.current_centroids(), Err(Error::Poisoned));
     assert_eq!(trainer.finalize(), Err(Error::Poisoned));
 }
 
@@ -835,4 +836,37 @@ fn euclidean_mode_does_not_normalize() {
     trainer.update().unwrap();
     trainer.end_epoch().unwrap();
     assert_eq!(trainer.finalize().unwrap().centroids(), &[0.0, 2.0]);
+}
+
+// Faiss `current_centroids` (`REF/e_means.py:243-258`): the EMA state in Euclidean mode, the unit-norm readout
+// in spherical mode, current after each update. This is what a caller of `update_with` assigns against.
+#[test]
+fn current_centroids_track_updates_in_both_modes() {
+    let builder = EMeans::new(2, 1).epochs(2.0).batch_size(2).alpha0(1.0);
+    let mut trainer = builder.begin(2, &[3.0, 4.0]).unwrap();
+    assert_eq!(trainer.current_centroids().unwrap(), &[3.0, 4.0]);
+    trainer.accumulate(&[0.0, 2.0, 0.0, 2.0]).unwrap();
+    trainer.update().unwrap();
+    assert_eq!(
+        trainer.current_centroids().unwrap(),
+        &[0.0, 2.0],
+        "Euclidean: the moved EMA state"
+    );
+
+    let builder = EMeans::new(2, 1).epochs(2.0).batch_size(2).alpha0(1.0).spherical(true);
+    let mut trainer = builder.begin(2, &[3.0, 4.0]).unwrap();
+    assert_close(
+        trainer.current_centroids().unwrap(),
+        &[0.6, 0.8],
+        1e-7,
+        "spherical: normalized init",
+    );
+    trainer.accumulate(&[0.0, 2.0, 0.0, 2.0]).unwrap();
+    trainer.update().unwrap();
+    assert_eq!(trainer.centroids, [0.0, 2.0], "the EMA state stays un-normalized");
+    assert_eq!(
+        trainer.current_centroids().unwrap(),
+        &[0.0, 1.0],
+        "spherical: the refreshed readout"
+    );
 }

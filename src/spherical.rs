@@ -2,7 +2,7 @@
 
 /// Project each `d`-wide row of `source` onto the unit sphere, into `out`.
 ///
-/// Each row is divided by its max-abs first and by its norm second, both in f32, so rows near
+/// Each row is divided by its max-abs first and by its norm second (squares summed in f64), so rows near
 /// `f32::MAX` or near the subnormal range do not overflow or underflow the norm. A zero row stays zero.
 pub(crate) fn normalize_into(source: &[f32], out: &mut [f32], d: usize) {
     assert_eq!(source.len(), out.len(), "source and out disagree on the length");
@@ -19,7 +19,11 @@ pub(crate) fn normalize_rows(rows: &mut [f32], d: usize) {
         for v in row.iter_mut() {
             *v /= scale;
         }
-        let norm = row.iter().fold(0.0f32, |sum, v| sum + v * v).sqrt();
+        // A sequential f32 sum of squares drifts ~3e-6 from unit norm at d=1536; f64 keeps it under 1e-6.
+        let norm = row
+            .iter()
+            .fold(0.0f64, |sum, &v| sum + f64::from(v) * f64::from(v))
+            .sqrt() as f32;
         let norm = if norm > 0.0 { norm } else { 1.0 };
         for v in row.iter_mut() {
             *v /= norm;

@@ -54,3 +54,20 @@ fn rows_are_independent_and_unit_norm() {
 fn mismatched_lengths_panic() {
     normalize_into(&[1.0, 2.0], &mut [0.0], 1);
 }
+
+// Implementation audit 2026-11-13: with all-positive rows the f32 rounding errors of a sequential sum of squares
+// add up instead of cancelling. Rows of [1, 0.1] repeated came out 2.881e-6 (d=1536) and 3.834e-6 (d=3072) off unit
+// norm, past the Phase 6 bound of 1e-6. The norm is now summed in f64.
+#[test]
+fn embedding_width_rows_stay_within_1e_6_of_unit_norm() {
+    for d in [768usize, 1536, 3072] {
+        let mut row: Vec<f32> = (0..d).map(|i| if i % 2 == 0 { 1.0 } else { 0.1 }).collect();
+        normalize_rows(&mut row, d);
+        let norm = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt();
+        assert!(
+            (norm - 1.0).abs() <= 1e-6,
+            "d={d}: norm {norm} is {} off unit",
+            (norm - 1.0).abs()
+        );
+    }
+}

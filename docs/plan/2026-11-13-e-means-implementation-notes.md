@@ -282,3 +282,17 @@ None.
 - The caller-driven README snippet is schematic (`order_for_this_pass`, `rows` are the caller's) vs a full runnable program: the first form is the runnable example, and a second example would duplicate Phase 8's parity driver.
 ### Open questions
 - Pending the finalization checkpoint: `bump release` (version, tag, push, install) and the scratch-crate-from-tag success criterion were NOT run in this phase; they run after the user approves.
+
+## Implementation audit fixes (orchestrator)
+
+### Design decisions
+- `Trainer::current_centroids()` (`src/trainer.rs`): returns `&self.centroids` in Euclidean mode and the refreshed unit-norm readout (`&self.snapshot`) in spherical mode; `Error::Poisoned` after `NonFiniteState`. Mirrors `REF/e_means.py:243-258`. It fills the design gap behind audit finding A2.
+
+### Deviations
+- `normalize_rows` (`src/spherical.rs`) sums squares in f64 and rounds the norm to f32. This supersedes the Phase 6 tradeoff that the summing order "only moves the last bits". That holds at small d, but at d=1536 with rows of `[1, 0.1]` repeated the f32 sum left the norm 2.88e-6 off unit (bound 1e-6). The new test `embedding_width_rows_stay_within_1e_6_of_unit_norm` fails on the old code and passes on the fix. After the fix, `separated_spherical_d32` parity objective moved from 7.417e-9 to 1.725e-9; centroid 1.587e-7 and labels 100% are unchanged.
+
+### Tradeoffs
+- f64 sum vs porting NumPy's pairwise f32 sum: f64 is simpler and tighter than both.
+
+### Open questions
+None. The quality-gate question (Phase 7 addendum) was closed by the panel: keep the three-seed gate (gap of 10-12 MSE on both mixture shapes over 20 e-means and 10 Lloyd seeds).

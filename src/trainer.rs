@@ -165,6 +165,19 @@ impl Trainer {
         &self.recipe
     }
 
+    /// The current centroids, k*d row-major: the EMA state, or its unit-norm readout in spherical mode
+    /// (`REF/e_means.py:243-258`). Read them again after each `update`, `update_with` or `end_epoch`.
+    /// Use them to compute the `BatchStats` that `update_with` applies.
+    pub fn current_centroids(&self) -> Result<&[f32]> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        Ok(match self.metric {
+            Metric::InnerProduct => &self.snapshot,
+            Metric::L2 => &self.centroids,
+        })
+    }
+
     /// Assign a chunk of the current logical batch and add it to the batch statistics.
     ///
     /// `rows` is row-major with `d` columns. A batch may arrive in any number of chunks; the result is the

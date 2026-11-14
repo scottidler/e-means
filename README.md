@@ -87,21 +87,23 @@ The reference's own unit fixtures are ported, and end-to-end fixtures are export
 Fixtures are committed under `tests/fixtures/`, so `otto ci` needs no Python. `compat/` regenerates them
 against a new pin.
 
-Measured parity, Rust direct kernel against Faiss 1.16.0 (centroid = worst per-centroid relative L2,
-objective = final-pass relative, labels = last-pass agreement):
+Measured parity against Faiss 1.16.0 (centroid = worst per-centroid relative L2, objective = final-pass
+relative, labels = last-pass agreement). The Rust side picks its kernel by `B * d`: `large` runs Gemm, the others
+run the direct kernel.
 
 | fixture | centroid | objective | labels |
 |---|---|---|---|
 | separated_d8 | 3.071e-7 | 1.012e-9 | 100% |
 | separated_d32 | 1.013e-7 | 3.160e-9 | 100% |
 | separated_d8_t2_5 | 2.976e-7 | 9.618e-10 | 100% |
-| separated_spherical_d32 | 1.587e-7 | 7.417e-9 | 100% |
+| separated_spherical_d32 | 1.587e-7 | 1.725e-9 | 100% |
 | separated_d2 | 4.663e-7 | 7.673e-9 | 100% |
 | oversplit | 1.051e-7 | 2.831e-9 | 100% |
-| large | 0 | 5.107e-8 | 100% |
+| large | 0 | 5.588e-8 | 100% |
 
-`large_revival` (revival on) is not asserted: the donor choice differs (D1), so Rust and Faiss diverge after the
-first split (centroid 1.952, objective 2.741e-2, labels 78.290%).
+`large_revival` (revival on) is a smoke test: it asserts splits > 0 and a final-pass objective within 10% of Faiss.
+The donor choice differs (D1), so Rust and Faiss diverge after the first split (centroid 1.952, objective
+2.741e-2, labels 78.290%); centroids and labels are not compared.
 
 ## Quality
 
@@ -110,12 +112,12 @@ against random-init Lloyd-25 (25 full iterations, k distinct random rows as init
 
 | seed | e-means T=5 | random-init Lloyd-25, no k-means++ |
 |---|---|---|
-| 10 | 51.6994 | 57.6729 |
-| 11 | 52.9388 | 65.5743 |
-| 12 | 51.4942 | 57.7037 |
+| 10 | 51.1034 | 57.6729 |
+| 11 | 52.9391 | 65.5743 |
+| 12 | 51.9625 | 57.7037 |
 
-Single runs. On this mixture e-means's spread across seeds (about 47 to 58) overlaps the lower tail of random-init
-Lloyd-25 (about 56), so one seed can lose to an unlucky init.
+Single runs, one per seed, so one run can lose to an unlucky init. On a mixture with random component sizes, the
+worst of 20 e-means seeds (57.585) lost to Lloyd-25 (57.430) on the same rows.
 
 ## Speed
 
