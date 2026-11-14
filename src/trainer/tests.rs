@@ -509,18 +509,104 @@ fn update_with_in_the_last_pass_drops_labels() {
     assert_eq!(model.epoch_stats()[0].objective, 10.0);
 }
 
-// REF/base.py:277-279: revival runs after every 5th update; until Phase 4 it splits nothing.
+fn splits(model: &Model) -> usize {
+    model.epoch_stats().iter().map(|s| s.splits).sum()
+}
+
+// Faiss tests/test_e_means.py:417-429 `test_revival_starts_on_fifth_update`. Replaces Phase 3's
+// `revival_hook_runs_without_splitting`, which pinned the no-op hook on this same fixture.
 #[test]
-fn revival_hook_runs_without_splitting() {
+fn revival_starts_on_fifth_update() {
     let x = [0.0f32; 10];
+    let builder = |epochs| {
+        EMeans::new(1, 2)
+            .epochs(epochs)
+            .batch_size(10)
+            .alpha0(0.5)
+            .unused_threshold(0.1)
+    };
+    let before = train(&builder(4.0), &x, 1, &[0.0, 10.0], &[10]);
+    assert_eq!(splits(&before), 0, "{TEST}:424");
+    let on_fifth = train(&builder(5.0), &x, 1, &[0.0, 10.0], &[10]);
+    assert_eq!(splits(&on_fifth), 1, "{TEST}:429");
+    assert_eq!(on_fifth.epoch_stats()[4].splits, 1, "the split lands in pass 5");
+}
+
+// Faiss tests/test_e_means.py:431-442 `test_revival_follows_current_batch_update`: the 10.0 row arrives
+// in the fifth batch, so the fifth update makes cluster 1 live before revival checks usage. The
+// reference relies on the d = 1 default tau of 0 (no revival at all); the explicit tau = 0.1 run makes
+// the order observable: revival before the update would see cluster 1 dead and split.
+#[test]
+fn revival_follows_current_batch_update() {
+    let x = [0.0f32, 0.0, 0.0, 0.0, 10.0];
+    let builder = EMeans::new(1, 2).epochs(1.0).batch_size(1).alpha0(0.5);
+    let model = train(&builder, &x, 1, &[0.0, 10.0], &[1]);
+    assert_eq!(splits(&model), 0, "{TEST}:442");
+    let model = train(&builder.unused_threshold(0.1), &x, 1, &[0.0, 10.0], &[1]);
+    assert_eq!(splits(&model), 0, "{TEST}:442 with tau = 0.1");
+}
+
+// Faiss tests/e_means_test_utils.py:1112-1148 `test_closing_statistics_survive_revival_and_object_deletion`
+#[test]
+fn closing_statistics_survive_revival() {
+    let mut trainer = EMeans::new(1, 2)
+        .epochs(1.0)
+        .batch_size(1)
+        .alpha0(0.5)
+        .unused_threshold(0.1)
+        .begin(5, &[0.0, 100.0])
+        .unwrap();
+    for value in 0..5 {
+        trainer
+            .update_with(BatchStats {
+                sums: &[f64::from(value), 0.0],
+                counts: &[1, 0],
+                objective: 1.0,
+            })
+            .unwrap();
+    }
+    assert_eq!(trainer.pass_splits, 1, "{UTILS}:1132");
+    let revived = trainer.centroids[1];
+    assert_ne!(revived, 100.0);
+    trainer.end_epoch().unwrap();
+    let model = trainer.finalize().unwrap();
+    assert_eq!(model.centroids(), &[2.0, revived], "{UTILS}:1137");
+    assert_eq!(model.epoch_stats()[0].objective, 5.0, "{UTILS}:1139");
+    assert_eq!(model.epoch_stats()[0].imbalance_factor, 2.0, "{UTILS}:1141");
+}
+
+// Revival step 8 and the error contract: a split child past f32::MAX poisons the trainer.
+#[test]
+fn split_overflow_is_non_finite_state_then_poisoned() {
     let builder = EMeans::new(1, 2)
-        .epochs(5.0)
-        .batch_size(10)
+        .epochs(1.0)
+        .batch_size(1)
         .alpha0(0.5)
         .unused_threshold(0.1);
-    let model = train(&builder, &x, 1, &[0.0, 10.0], &[10]);
-    assert!(model.epoch_stats().iter().all(|s| s.splits == 0));
-    assert_eq!(model.epoch_stats().len(), 5);
+    let mut trainer = builder.begin(5, &[0.0, f32::MAX]).unwrap();
+    for _ in 0..4 {
+        trainer.accumulate(&[f32::MAX]).unwrap();
+        trainer.update().unwrap();
+    }
+    trainer.accumulate(&[f32::MAX]).unwrap();
+    let err = trainer.update().unwrap_err();
+    assert!(
+        matches!(err, Error::NonFiniteState(ref m) if m.contains("centroid 1 into 0")),
+        "{err}"
+    );
+    assert_eq!(trainer.centroids, vec![0.0, f32::MAX], "nothing of the split committed");
+    assert_eq!(trainer.update(), Err(Error::Poisoned));
+    assert_eq!(trainer.accumulate(&[0.0]), Err(Error::Poisoned));
+    assert_eq!(trainer.finalize(), Err(Error::Poisoned));
+}
+
+#[test]
+fn the_revival_stream_follows_the_seed() {
+    let first = |builder: EMeans| builder.begin(2, &[0.0, 1.0]).unwrap().split_rng.next_u64();
+    let default = first(EMeans::new(1, 2));
+    assert_eq!(default, Stream::new(1234, StreamId::Revival).next_u64());
+    assert_eq!(first(EMeans::new(1, 2).seed(1234)), default);
+    assert_ne!(first(EMeans::new(1, 2).seed(1235)), default);
 }
 
 // EMA step 2: with alpha == 1 there is no decay, so an untouched cluster keeps its mass

@@ -8,4 +8,6 @@ repository = "https://github.com/scottidler/e-means"
 
 [dependencies]
 log = "0.4.35"
+rand_chacha = "0.10.0"
+rand_core = "0.10.1"
 thiserror = "2.0.21"

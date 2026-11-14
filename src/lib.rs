@@ -9,6 +9,8 @@ mod config;
 mod error;
 mod model;
 pub mod recipe;
+mod revival;
+mod rng;
 mod trainer;
 
 pub use config::EMeans;

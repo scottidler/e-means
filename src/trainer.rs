@@ -10,6 +10,8 @@ use crate::assign::{self, Kernel};
 use crate::error::{Error, Result};
 use crate::model::{EpochStats, Model};
 use crate::recipe::{CHECK_UNUSED_EVERY, INIT_USAGE, Recipe, scheduled_alpha};
+use crate::revival;
+use crate::rng::{Stream, StreamId};
 
 /// Rows per assignment block, counted from the start of the logical batch.
 ///
@@ -69,6 +71,8 @@ pub struct Trainer {
     step: usize,
     epoch: usize,
     poisoned: bool,
+    /// Revival's donor draws; consumed only by revival events that split.
+    split_rng: Stream,
 }
 
 impl BatchAccumulator {
@@ -91,9 +95,9 @@ impl BatchAccumulator {
 
 impl Trainer {
     /// Start a run from validated parts; `EMeans::begin` owns the validation.
-    pub(crate) fn new(d: usize, k: usize, recipe: Recipe, init: &[f32]) -> Self {
+    pub(crate) fn new(d: usize, k: usize, recipe: Recipe, init: &[f32], seed: u64) -> Self {
         debug!(
-            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={}",
+            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={} seed={seed}",
             recipe.batch_size, recipe.alpha0, recipe.epoch_rows, recipe.total_steps
         );
         let mut trainer = Trainer {
@@ -117,6 +121,7 @@ impl Trainer {
             step: 0,
             epoch: 0,
             poisoned: false,
+            split_rng: Stream::new(seed, StreamId::Revival),
             recipe,
         };
         trainer.start_pass();
@@ -467,9 +472,17 @@ impl Trainer {
     }
 
     /// Revival every `CHECK_UNUSED_EVERY` updates, then advance the step and clear the batch (`REF/base.py:277-286`).
+    ///
+    /// A split that leaves f32 range poisons the trainer.
     fn finish_step(&mut self, due: usize) -> Result<()> {
         if (self.step + 1).is_multiple_of(CHECK_UNUSED_EVERY) {
-            self.pass_splits += self.revive()?;
+            match self.revive() {
+                Ok(splits) => self.pass_splits += splits,
+                Err(err) => {
+                    self.poisoned = true;
+                    return Err(err);
+                }
+            }
         }
         self.step += 1;
         self.pass_rows += due;
@@ -477,13 +490,19 @@ impl Trainer {
         Ok(())
     }
 
-    /// Revival hook: no clusters are split yet.
+    /// Split a heavy cluster into each dead one (`REF/e_means.py:261-300`).
     fn revive(&mut self) -> Result<usize> {
         trace!(
             "Trainer::revive: step={} threshold={}",
             self.step, self.recipe.unused_threshold
         );
-        Ok(0)
+        revival::revive(
+            &mut self.usage,
+            &mut self.centroids,
+            self.d,
+            self.recipe.unused_threshold,
+            &mut self.split_rng,
+        )
     }
 
     /// Reset the pass statistics; the last pass also captures labels (`REF/e_means.py:347-356`).
