@@ -166,6 +166,27 @@ The 8- and 32-thread assign cells and the 32-thread train cells are in the full 
 not gated. At d=8 the default kernel is slower than `emeans` because it keeps the exact difference form (see the
 limit above); `always_gemm(true)` is the speed-parity path.
 
+Before and after, the same `otto h2h` ratios (ours / emeans). v0.1.0 is the first run, on the `v0.1.0` release
+(`5f0b62d`, 2026-11-13), which had no `always_gemm` option. v0.2.0 is the table above.
+
+| cell | v0.1.0 | v0.2.0 |
+|---|---|---|
+| train d=32, 1 thread | 1.648 | 1.050 |
+| train d=32, 8 threads | 2.031 | 0.985 |
+| train d=32, 64 threads | 1.554 | 0.926 |
+| assign d=32, 1 thread | 1.808 | 1.074 |
+| assign d=32, 64 threads | 2.900 | 1.194 |
+| train d=8, default, 1 thread | 4.408 | 1.593 |
+| train d=8, default, 8 threads | 5.844 | 1.348 |
+| train d=8, default, 64 threads | 2.243 | 0.947 |
+| assign d=8, default, 1 thread | 4.442 | 1.922 |
+| assign d=8, default, 64 threads | 4.549 | 1.644 |
+| train d=8, `always_gemm(true)`, 1 thread | n/a | 1.152 |
+| train d=8, `always_gemm(true)`, 8 threads | n/a | 1.045 |
+| train d=8, `always_gemm(true)`, 64 threads | n/a | 0.830 |
+| assign d=8, `always_gemm(true)`, 1 thread | n/a | 1.099 |
+| assign d=8, `always_gemm(true)`, 64 threads | n/a | 1.181 |
+
 ## Development
 
 `otto ci` runs lint, check, and test. `otto compat` regenerates the Faiss fixtures (needs Python and
