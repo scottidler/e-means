@@ -8,12 +8,14 @@ repository = "https://github.com/scottidler/e-means"
 
 [dependencies]
 log = "0.4.35"
+matrixmultiply = "0.3.11"
 rand_chacha = "0.10.0"
 rand_core = "0.10.1"
 rayon = "1.12.0"
 thiserror = "2.0.21"
 
 [dev-dependencies]
+criterion = "0.8.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 
@@ -21,3 +23,11 @@ serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 # so optimizing does not change a single result bit.
 [profile.test]
 opt-level = 3
+
+[[bench]]
+name = "assign"
+harness = false
+
+[[bench]]
+name = "train"
+harness = false

@@ -41,6 +41,12 @@ tasks:
     bash: |
       cargo test
 
+  # Criterion benches (NOT part of ci)
+  bench:
+    help: "Run the criterion benches, assign and train (NOT part of ci)"
+    bash: |
+      cargo bench --bench assign --bench train
+
   # Mutation testing: no args = whole workspace; --diff = scoped to a diff (NOT part of ci)
   mutants:
     help: "Mutation-test the workspace; --diff FILE scopes to a diff (CI use; NOT part of ci)"

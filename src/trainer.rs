@@ -115,8 +115,9 @@ impl Trainer {
         capture_labels: bool,
         metric: Metric,
     ) -> Self {
+        let kernel = Kernel::for_batch(recipe.batch_size, d);
         debug!(
-            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={} seed={seed} capture_labels={capture_labels} metric={metric:?}",
+            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={} seed={seed} capture_labels={capture_labels} metric={metric:?} kernel={kernel:?}",
             recipe.batch_size, recipe.alpha0, recipe.epoch_rows, recipe.total_steps
         );
         let mut centroids = init.to_vec();
@@ -126,7 +127,7 @@ impl Trainer {
         let mut trainer = Trainer {
             d,
             k,
-            kernel: Kernel::Direct,
+            kernel,
             metric,
             usage: vec![INIT_USAGE; k],
             snapshot: centroids.clone(),

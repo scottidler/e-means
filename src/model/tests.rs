@@ -159,3 +159,45 @@ fn assign_over_many_blocks_is_thread_count_invariant() {
         );
     }
 }
+
+/// `n` rows of `d` around `k` well separated centers: row `i` sits near center `i % k`, which is `+8` on
+/// coordinate `i % k`; small deterministic noise elsewhere.
+fn separated_rows(n: usize, d: usize, k: usize) -> Vec<f32> {
+    let mut state = 5u64;
+    let mut x = Vec::with_capacity(n * d);
+    for i in 0..n {
+        for c in 0..d {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let noise = ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.2;
+            x.push(if c == i % k { 8.0 + noise } else { noise });
+        }
+    }
+    x
+}
+
+// The kernel is picked once from the recipe's `B * d` and the model keeps it for `assign`.
+#[test]
+fn model_keeps_the_kernel_picked_from_batch_times_d() {
+    let (n, d, k) = (4000, 32, 4);
+    let x = separated_rows(n, d, k);
+    let init = x[..k * d].to_vec();
+    for (batch, kernel) in [(3999, Kernel::Direct), (4000, Kernel::Gemm)] {
+        for spherical in [false, true] {
+            let model = crate::EMeans::new(d, k)
+                .epochs(2.0)
+                .batch_size(batch)
+                .spherical(spherical)
+                .train_from(&x, &init)
+                .unwrap();
+            assert_eq!(model.kernel, kernel, "B={batch} d={d} spherical={spherical}");
+            let assignment = model.assign(&x).unwrap();
+            let expected: Vec<u32> = (0..n).map(|i| (i % k) as u32).collect();
+            assert_eq!(assignment.labels, expected, "B={batch} spherical={spherical}");
+            if !spherical {
+                assert!(assignment.distances.iter().all(|&v| v >= 0.0), "B={batch}");
+            }
+        }
+    }
+}
