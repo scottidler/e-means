@@ -5,13 +5,13 @@ exclude_re = [
   # Lane tie-break `lane_id < best_id`: it runs only on equal scores. Each lane
   # holds ids of one fixed remainder mod 16, so two lanes never hold the same id
   # and `<` agrees with `<=`.
-  'src/assign\.rs:263:63: replace < with <= in lane_scan_l2$',
-  'src/assign\.rs:303:70: replace < with <= in lane_scan$',
-  'src/assign\.rs:487:70: replace < with <= in lane_groups_best$',
+  'src/assign\.rs:272:63: replace < with <= in lane_scan_l2$',
+  'src/assign\.rs:312:70: replace < with <= in lane_scan$',
+  'src/assign\.rs:516:70: replace < with <= in lane_groups_best$',
   # Scratch growth guard `len < need`: on equality, reserve_exact(0) and a
   # same-length resize do nothing.
-  'src/assign\.rs:405:26: replace < with <= in direct_lanes$',
+  'src/assign\.rs:414:26: replace < with <= in direct_lanes$',
   # `owners == 1` branch: both branches do the same adds in the same row order,
   # so every result bit matches.
-  'src/trainer\.rs:671:19: replace == with != in Trainer::reduce_partitioned$',
+  'src/trainer\.rs:727:19: replace == with != in Trainer::reduce_rows$',
 ]

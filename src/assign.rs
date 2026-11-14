@@ -40,6 +40,15 @@ pub(crate) enum Metric {
     InnerProduct,
 }
 
+/// The index of the first NaN or infinite value of `values`, if any.
+///
+/// One pass that only ORs the per-value test, which the compiler vectorizes, then the positional search on
+/// a hit: clean input, the hot case, never takes the value-at-a-time early-exit loop.
+pub(crate) fn first_non_finite(values: &[f32]) -> Option<usize> {
+    let any = values.iter().fold(false, |any, v| any | !v.is_finite());
+    if any { values.iter().position(|v| !v.is_finite()) } else { None }
+}
+
 /// Lanes of the argmin scan: a row's scores are scanned as 16 interleaved streams, which the compiler
 /// vectorizes on the baseline target.
 const LANES: usize = 16;
@@ -464,8 +473,34 @@ fn lane_groups_best(
 ) -> (u32, f32) {
     let mut lane_best = [worst; LANES];
     let mut lane_id = [0u32; LANES];
+    let mut keep = |acc: &[f32; LANES], base: u32| {
+        for l in 0..LANES {
+            if better(acc[l], lane_best[l]) {
+                lane_best[l] = acc[l];
+                lane_id[l] = base + l as u32;
+            }
+        }
+    };
     let mut base = 0u32;
-    for group in layout.chunks_exact(LANES * d) {
+    // Two groups per pass over the row: each lane still folds its own centroid from 0.0, coordinate 0 first,
+    // so every score is unchanged, and the two groups' add chains run side by side instead of end to end.
+    let mut pairs = layout.chunks_exact(2 * LANES * d);
+    for pair in &mut pairs {
+        let (first, second) = pair.split_at(LANES * d);
+        let (first, _) = first.as_chunks::<LANES>();
+        let (second, _) = second.as_chunks::<LANES>();
+        let mut acc = [[0.0f32; LANES]; 2];
+        for ((&x, lane0), lane1) in row.iter().zip(first).zip(second) {
+            for l in 0..LANES {
+                acc[0][l] = fold(acc[0][l], x, lane0[l]);
+                acc[1][l] = fold(acc[1][l], x, lane1[l]);
+            }
+        }
+        keep(&acc[0], base);
+        keep(&acc[1], base + LANES as u32);
+        base += 2 * LANES as u32;
+    }
+    for group in pairs.remainder().chunks_exact(LANES * d) {
         let (coordinates, _) = group.as_chunks::<LANES>();
         let mut acc = [0.0f32; LANES];
         for (&x, lane) in row.iter().zip(coordinates) {
@@ -473,13 +508,7 @@ fn lane_groups_best(
                 acc[l] = fold(acc[l], x, lane[l]);
             }
         }
-        for l in 0..LANES {
-            if better(acc[l], lane_best[l]) {
-                lane_best[l] = acc[l];
-                lane_id[l] = base + l as u32;
-            }
-        }
-        base += LANES as u32;
+        keep(&acc, base);
     }
     let (mut best, mut best_id) = (worst, 0u32);
     for l in 0..LANES {

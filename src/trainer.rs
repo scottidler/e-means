@@ -39,6 +39,11 @@ const _: () = assert!(BLOCK_ROWS.is_multiple_of(TASK_ROWS), "a task must not str
 /// split pays only when the per-row adds (d of them) outweigh P label reads. Measured at 64 threads (Phase 5
 /// of `docs/plan/2026-11-13-assign-performance.md`): the d=32 train batch (262144 values) gains ~11% in
 /// parallel, the d=8 batch (8192 values) doubles train time; any value in (8192, 262144] keeps both.
+///
+/// `accumulate_indexed` gathers by the same line (`Trainer::reduces_in_parallel`). Measured at 32 threads,
+/// `train` with task-local row buffers over `train` with one batch-wide buffer, n=100000 k=256 T=5: 1.05,
+/// 1.02, 1.10 at 8192, 16384, 32768 values (d=8); 1.02, 1.00 at 16384, 32768 (d=32); 0.91, 0.87 at 65536,
+/// 131072 (d=8); 0.93, 0.85, 0.75 at 65536, 131072, 262144 (d=32).
 pub(crate) const PARALLEL_REDUCE_VALUES: usize = 1 << 16;
 
 /// Rows per rayon task for a call of `blocks` blocks on a pool of `threads`: `TASK_ROWS` when the call has
@@ -93,7 +98,7 @@ pub struct Trainer {
     batch: BatchAccumulator,
     /// Rows of a partial block, waiting for the next chunk.
     carry: Vec<f32>,
-    /// `accumulate_indexed`'s batch buffer: the batch's rows gathered from `x`, scratch between batches.
+    /// `accumulate_indexed`'s batch-wide row buffer, used only by batches that reduce on one thread.
     gathered: Vec<f32>,
     block_labels: Vec<u32>,
     /// Per-row score of the block's assignment: squared distance, or inner product in spherical mode.
@@ -243,7 +248,7 @@ impl Trainer {
         if chunk > remaining {
             return Err(Error::BatchOverflow { chunk, remaining });
         }
-        if let Some(at) = rows.iter().position(|v| !v.is_finite()) {
+        if let Some(at) = assign::first_non_finite(rows) {
             return Err(Error::NonFiniteInput(format!(
                 "chunk row {} column {} is {}",
                 at / self.d,
@@ -503,13 +508,21 @@ impl Trainer {
     }
 
     /// Assign and add one whole batch of rows of `x` (row-major, `d` columns), given by `ids`, in one
-    /// parallel region: each task gathers its rows (a 256-row block, or a `task_rows` piece of one) into the
-    /// batch buffer, scans them for NaN/inf, and assigns them against the snapshot. `train` only; the caller-driven path is `accumulate`.
+    /// parallel region: each task gathers its rows (a 256-row block, or a `task_rows` piece of one), scans
+    /// them for NaN/inf, and assigns them against the snapshot. `train` only; the caller-driven path is
+    /// `accumulate`.
     ///
-    /// Bitwise equal to `accumulate` of the gathered rows: blocks are cut at 256 rows from the batch start,
-    /// and both share `reduce`. On a NaN or infinite value the error names the
-    /// first offending batch row, the same message `accumulate` gives, and the batch statistics, `received`
-    /// and the captured labels are unchanged; only the L2 snapshot is refreshed, as `accumulate` does.
+    /// Where the gathered rows live follows the reduction. A batch that reduces in parallel
+    /// (`reduces_in_parallel`) gathers into a buffer owned by each task, and its reduction reads the rows
+    /// from `x`: one batch-wide buffer, written by the tasks and then read by every owner, moved each of its
+    /// cache lines between cores twice per batch. A smaller batch gathers into the batch-wide buffer, which
+    /// its one-thread reduction then reads in order.
+    ///
+    /// Bitwise equal to `accumulate` of the gathered rows either way: blocks are cut at 256 rows from the
+    /// batch start, and every reduction adds the same rows in the same order. On a NaN or infinite value the
+    /// error names the first offending batch row, the same message `accumulate` gives, and the batch
+    /// statistics, `received` and the captured labels are unchanged; only the L2 snapshot is refreshed, as
+    /// `accumulate` does.
     pub(crate) fn accumulate_indexed(&mut self, x: &[f32], ids: &[usize]) -> Result<()> {
         trace!(
             "Trainer::accumulate_indexed: rows={} step={} epoch={}",
@@ -525,10 +538,10 @@ impl Trainer {
             self.snapshot.copy_from_slice(&self.centroids);
         }
         let d = self.d;
+        let task_local = self.reduces_in_parallel(due);
         let mut gathered = std::mem::take(&mut self.gathered);
         let mut labels = std::mem::take(&mut self.block_labels);
         let mut scores = std::mem::take(&mut self.block_scores);
-        gathered.resize(due * d, 0.0);
         labels.resize(due, 0);
         scores.resize(due, 0.0);
 
@@ -536,48 +549,66 @@ impl Trainer {
         let (kernel, metric, snapshot) = (self.kernel, self.metric, &self.snapshot);
         let norms = assign::centroid_norms(kernel, metric, snapshot, d);
         let task = task_rows(due.div_ceil(BLOCK_ROWS), rayon::current_num_threads());
-        gathered
-            .par_chunks_mut(task * d)
-            .zip(ids.par_chunks(task))
+        let assign_task =
+            |index: usize, rows: &[f32], labels: &mut [u32], scores: &mut [f32], scratch: &mut Vec<f32>| {
+                if let Some(at) = assign::first_non_finite(rows) {
+                    first_bad.fetch_min(index * task * d + at, Ordering::Relaxed);
+                    return;
+                }
+                assign::nearest(kernel, metric, rows, snapshot, &norms, d, labels, scores, scratch);
+            };
+        let gather = |rows: &mut [f32], task_ids: &[usize]| {
+            for (row, &i) in rows.chunks_exact_mut(d).zip(task_ids) {
+                row.copy_from_slice(&x[i * d..(i + 1) * d]);
+            }
+        };
+        let tasks = ids
+            .par_chunks(task)
             .zip(labels.par_chunks_mut(task))
             .zip(scores.par_chunks_mut(task))
-            .enumerate()
-            .for_each_init(
-                Vec::new,
-                |scratch, (index, (((rows, task_ids), task_labels), task_scores))| {
-                    for (row, &i) in rows.chunks_exact_mut(d).zip(task_ids) {
-                        row.copy_from_slice(&x[i * d..(i + 1) * d]);
-                    }
-                    if let Some(at) = rows.iter().position(|v| !v.is_finite()) {
-                        first_bad.fetch_min(index * task * d + at, Ordering::Relaxed);
-                        return;
-                    }
-                    assign::nearest(
-                        kernel,
-                        metric,
-                        rows,
-                        snapshot,
-                        &norms,
-                        d,
-                        task_labels,
-                        task_scores,
-                        scratch,
-                    );
+            .enumerate();
+        if task_local {
+            tasks.for_each_init(
+                || (Vec::new(), Vec::new()),
+                |(scratch, rows), (index, ((task_ids, task_labels), task_scores))| {
+                    rows.resize(task_ids.len() * d, 0.0);
+                    gather(rows, task_ids);
+                    assign_task(index, rows, task_labels, task_scores, scratch);
                 },
             );
+        } else {
+            gathered.resize(due * d, 0.0);
+            tasks.zip(gathered.par_chunks_mut(task * d)).for_each_init(
+                Vec::new,
+                |scratch, ((index, ((task_ids, task_labels), task_scores)), rows)| {
+                    gather(rows, task_ids);
+                    assign_task(index, rows, task_labels, task_scores, scratch);
+                },
+            );
+        }
 
         let at = first_bad.into_inner();
-        let result = if at == usize::MAX {
-            let blocks: Vec<&[f32]> = gathered.chunks(BLOCK_ROWS * d).collect();
-            self.reduce(&blocks, &labels, &scores);
-            Ok(())
-        } else {
+        let result = if at != usize::MAX {
             Err(Error::NonFiniteInput(format!(
                 "chunk row {} column {} is {}",
                 at / d,
                 at % d,
-                gathered[at]
+                x[ids[at / d] * d + at % d]
             )))
+        } else if task_local {
+            let owners = self.reduce_owners(due);
+            self.reduce_rows(
+                || ids.iter().map(|&i| &x[i * d..(i + 1) * d]),
+                ids.chunks(BLOCK_ROWS).map(<[usize]>::len),
+                &labels,
+                &scores,
+                owners,
+            );
+            Ok(())
+        } else {
+            let blocks: Vec<&[f32]> = gathered.chunks(BLOCK_ROWS * d).collect();
+            self.reduce(&blocks, &labels, &scores);
+            Ok(())
         };
         self.gathered = gathered;
         self.block_labels = labels;
@@ -644,32 +675,57 @@ impl Trainer {
     /// Batches of at least `PARALLEL_REDUCE_VALUES` values partition the counts and sums by cluster, one
     /// owner per pool thread; smaller ones add them on this thread.
     fn reduce(&mut self, blocks: &[&[f32]], labels: &[u32], scores: &[f32]) {
-        let owners = if labels.len() * self.d >= PARALLEL_REDUCE_VALUES {
-            rayon::current_num_threads()
-        } else {
-            1
-        };
+        let owners = self.reduce_owners(labels.len());
         self.reduce_partitioned(blocks, labels, scores, owners);
+    }
+
+    /// Whether a batch of `rows` rows reduces in a parallel region: at or above `PARALLEL_REDUCE_VALUES`
+    /// values.
+    fn reduces_in_parallel(&self, rows: usize) -> bool {
+        rows * self.d >= PARALLEL_REDUCE_VALUES
+    }
+
+    /// Owners of a reduction over `rows` rows: one per pool thread when it reduces in parallel, else 1.
+    fn reduce_owners(&self, rows: usize) -> usize {
+        if self.reduces_in_parallel(rows) { rayon::current_num_threads() } else { 1 }
     }
 
     /// `reduce` with the clusters split into `owners` contiguous ranges (clamped to `1..=k`), one parallel
     /// task each.
+    fn reduce_partitioned(&mut self, blocks: &[&[f32]], labels: &[u32], scores: &[f32], owners: usize) {
+        let d = self.d;
+        self.reduce_rows(
+            || blocks.iter().flat_map(|block| block.chunks_exact(d)),
+            blocks.iter().map(|block| block.len() / d),
+            labels,
+            scores,
+            owners,
+        );
+    }
+
+    /// The reduction behind `reduce` and `accumulate_indexed`: `rows()` walks the batch's rows in order, one
+    /// per entry of `labels` and `scores`, and `block_rows` gives the row count of each block in order.
     ///
     /// Every owner walks all rows in order and adds, in place into its slice of the batch counts and sums,
     /// only the rows labelled with a cluster it owns: each cluster sees the same f64 adds in the same order
     /// as one thread walking the rows, so the owner count never changes a bit. Never a zero-started partial
     /// merged later, which would re-associate the adds. The objective, the spherical `2 * rows` term, the
     /// captured labels and `assigned` stay on this thread, in row order, after the owners join.
-    fn reduce_partitioned(&mut self, blocks: &[&[f32]], labels: &[u32], scores: &[f32], owners: usize) {
+    fn reduce_rows<'r, R>(
+        &mut self,
+        rows: impl Fn() -> R + Sync,
+        block_rows: impl Iterator<Item = usize>,
+        labels: &[u32],
+        scores: &[f32],
+        owners: usize,
+    ) where
+        R: Iterator<Item = &'r [f32]>,
+    {
         let (d, k) = (self.d, self.k);
         let owners = owners.clamp(1, k);
-        trace!(
-            "Trainer::reduce_partitioned: blocks={} rows={} owners={owners}",
-            blocks.len(),
-            labels.len()
-        );
+        trace!("Trainer::reduce_partitioned: rows={} owners={owners}", labels.len());
         if owners == 1 {
-            add_owned_rows(blocks, labels, d, 0, &mut self.batch.counts, &mut self.batch.sums);
+            add_owned_rows(rows(), labels, d, 0, &mut self.batch.counts, &mut self.batch.sums);
         } else {
             let mut parts = Vec::with_capacity(owners);
             let (mut counts, mut sums) = (&mut self.batch.counts[..], &mut self.batch.sums[..]);
@@ -684,13 +740,12 @@ impl Trainer {
                 first = end;
             }
             parts.into_par_iter().for_each(|(first, counts, sums)| {
-                add_owned_rows(blocks, labels, d, first, counts, sums);
+                add_owned_rows(rows(), labels, d, first, counts, sums);
             });
         }
 
         let mut at = 0;
-        for block in blocks {
-            let rows = block.len() / d;
+        for rows in block_rows {
             if self.metric == Metric::InnerProduct {
                 // `2 - 2 * ip` per row, as `2 * rows` per block plus the f32 values `-2 * ip`
                 // (`REF/e_means.py:432-434`).
@@ -817,23 +872,24 @@ impl Trainer {
 }
 
 /// Add the rows labelled `first..first + counts.len()` into `counts` and `sums` (the owned slices, `sums`
-/// `counts.len() * d` long), walking every row of `blocks` in order; other rows are skipped.
-fn add_owned_rows(blocks: &[&[f32]], labels: &[u32], d: usize, first: usize, counts: &mut [u64], sums: &mut [f64]) {
-    let mut at = 0;
-    for block in blocks {
-        let rows = block.len() / d;
-        for (row, &label) in block.chunks_exact(d).zip(&labels[at..at + rows]) {
-            let j = (label as usize).wrapping_sub(first);
-            if j >= counts.len() {
-                continue;
-            }
+/// `counts.len() * d` long), walking `rows` in order, one per label; other rows are skipped.
+fn add_owned_rows<'r>(
+    rows: impl Iterator<Item = &'r [f32]>,
+    labels: &[u32],
+    d: usize,
+    first: usize,
+    counts: &mut [u64],
+    sums: &mut [f64],
+) {
+    rows.zip(labels).for_each(|(row, &label)| {
+        let j = (label as usize).wrapping_sub(first);
+        if j < counts.len() {
             counts[j] += 1;
             for (s, &x) in sums[j * d..(j + 1) * d].iter_mut().zip(row) {
                 *s += f64::from(x);
             }
         }
-        at += rows;
-    }
+    });
 }
 
 #[cfg(test)]

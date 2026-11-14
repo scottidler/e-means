@@ -124,7 +124,7 @@ impl Model {
             .zip(distances.par_chunks_mut(task))
             .enumerate()
             .for_each_init(Vec::new, |scratch, (index, ((piece, task_labels), task_distances))| {
-                if let Some(at) = piece.iter().position(|v| !v.is_finite()) {
+                if let Some(at) = assign::first_non_finite(piece) {
                     first_bad.fetch_min(index * task * self.d + at, Ordering::Relaxed);
                     return;
                 }

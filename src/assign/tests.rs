@@ -644,6 +644,22 @@ fn lane_scan_of_nothing_is_id_zero_at_the_identity() {
     assert_eq!(lane_scan(&[f32::NAN; 20], f32::INFINITY, |v, b| v < b).0, 0);
 }
 
+// The OR-only first pass must agree with a plain positional search: nothing on clean input, the lowest
+// index otherwise, including a slice of only non-finite values and an even count of them (an inverted or
+// XOR-ed first pass misses those).
+#[test]
+fn first_non_finite_is_the_lowest_nan_or_infinite_index() {
+    assert_eq!(first_non_finite(&[]), None);
+    assert_eq!(first_non_finite(&[0.0, -1.5, f32::MAX, f32::MIN_POSITIVE]), None);
+    assert_eq!(first_non_finite(&[1.0, f32::NAN, f32::INFINITY]), Some(1));
+    assert_eq!(first_non_finite(&[1.0, 2.0, f32::NEG_INFINITY]), Some(2));
+    assert_eq!(first_non_finite(&[f32::NAN; 4]), Some(0));
+    let mut long = vec![1.0f32; 100];
+    long[70] = f32::INFINITY;
+    long[93] = f32::NAN;
+    assert_eq!(first_non_finite(&long), Some(70));
+}
+
 #[test]
 fn centroid_norms_exist_only_for_gemm_l2() {
     let centroids = [1.0f32, 2.0, 3.0, 4.0];

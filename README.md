@@ -24,7 +24,7 @@ published nowhere: consumers take a git tag. No BLAS linkage: the Gemm kernel is
 ## Use
 
 ```toml
-e-means = { git = "https://github.com/scottidler/e-means", tag = "v0.1.0", version = "0.1.0" }
+e-means = { git = "https://github.com/scottidler/e-means", tag = "v0.2.1", version = "0.2.1" }
 ```
 
 In-memory data:
@@ -122,70 +122,73 @@ worst of 20 e-means seeds (57.585) lost to Lloyd-25 (57.430) on the same rows.
 
 ## Speed
 
-Measured on a 64-thread machine (Threadripper 9970X), 2026-11-14, on the release tree (fused Gemm L2 scan included).
-Load average (1 min) at the start of each run is given with it. Every number is from the command beside it; rerun them
-to compare on your hardware.
+Measured on a 64-thread machine (Threadripper 9970X), 2026-11-14, on the v0.2.1 tree. Load average (1 min) at the
+start of each run is given with it. Every number is from the command beside it; rerun them to compare on your hardware.
 
-`otto bench` (criterion, median of the interval; load 3.74 at start):
+`otto bench` (criterion, median of the interval; load 2.67 at start):
 
 | bench | kernel | this crate |
 |---|---|---|
-| train n=100000 d=32 k=256 T=5 (B=8192) | Gemm | 21.47 ms |
-| train n=100000 d=8 k=256 T=5 (B=1024) | Direct | 36.83 ms |
-| assign 100000 rows d=8 k=256 | Direct | 829.5 us |
-| assign 100000 rows d=8 k=256 | Gemm | 570.5 us |
-| assign 100000 rows d=32 k=256 | Direct | 2.165 ms |
-| assign 100000 rows d=32 k=256 | Gemm | 785.7 us |
+| train n=100000 d=32 k=256 T=5 (B=8192) | Gemm | 18.30 ms |
+| train n=100000 d=8 k=256 T=5 (B=1024) | Direct | 37.48 ms |
+| assign 100000 rows d=8 k=256 | Direct | 780.5 us |
+| assign 100000 rows d=8 k=256 | Gemm | 562.2 us |
+| assign 100000 rows d=32 k=256 | Direct | 2.047 ms |
+| assign 100000 rows d=32 k=256 | Gemm | 778.3 us |
 
 Large k, `/usr/bin/time -f "%M KB" target/release/examples/large-k` (n=200000, d=32, k=65536, T=1, 64 threads; `train`
-time printed by the example, load 1.97 at start; 3 runs): 0.625, 0.603, 0.608 s; peak RSS 151960, 144740, 151616 KB.
+time printed by the example, load 2.84 at start; 3 runs): 0.625, 0.624, 0.604 s; peak RSS 155116, 154720, 151288 KB.
 Before the tiling work, the same example took 4.2-4.5 s and 2.2 GB.
 
-Against the `emeans` 0.1.1 crate, `otto h2h` (load 1.98 at start; ratio = median of 15 interleaved paired ratios, ours
+Against the `emeans` 0.1.1 crate, `otto h2h` (load 2.69 at start; ratio = median of 15 interleaved paired ratios, ours
 / emeans, so below 1 is faster than `emeans`; 1-thread cells pinned with `taskset -c 2`; ms are medians):
 
 | cell | ours ms | emeans ms | ratio |
 |---|---|---|---|
-| train d=32, 1 thread | 95.98 | 92.46 | 1.050 |
-| train d=32, 8 threads | 19.97 | 19.32 | 0.985 |
-| train d=32, 64 threads | 21.70 | 23.11 | 0.926 |
-| assign d=32, 1 thread | 17.35 | 16.16 | 1.074 |
-| assign d=32, 64 threads | 0.78 | 0.66 | 1.194 |
-| train d=8, default, 1 thread | 82.68 | 52.14 | 1.593 |
-| train d=8, default, 8 threads | 17.07 | 12.50 | 1.348 |
-| train d=8, default, 64 threads | 40.27 | 42.03 | 0.947 |
-| assign d=8, default, 1 thread | 18.42 | 9.59 | 1.922 |
-| assign d=8, default, 64 threads | 0.80 | 0.48 | 1.644 |
-| train d=8, `always_gemm(true)`, 1 thread | 57.11 | 49.19 | 1.152 |
-| train d=8, `always_gemm(true)`, 8 threads | 16.78 | 12.44 | 1.045 |
-| train d=8, `always_gemm(true)`, 64 threads | 33.64 | 40.52 | 0.830 |
-| assign d=8, `always_gemm(true)`, 1 thread | 11.60 | 10.55 | 1.099 |
-| assign d=8, `always_gemm(true)`, 64 threads | 0.54 | 0.46 | 1.181 |
+| train d=32, 1 thread | 92.32 | 79.80 | 1.050 |
+| train d=32, 8 threads | 17.95 | 18.86 | 0.931 |
+| train d=32, 64 threads | 18.82 | 24.41 | 0.772 |
+| assign d=32, 1 thread | 16.72 | 16.30 | 1.024 |
+| assign d=32, 64 threads | 0.90 | 0.80 | 1.128 |
+| train d=8, default, 1 thread | 79.11 | 51.44 | 1.541 |
+| train d=8, default, 8 threads | 21.58 | 14.31 | 1.433 |
+| train d=8, default, 64 threads | 39.95 | 40.16 | 0.990 |
+| assign d=8, default, 1 thread | 17.27 | 9.55 | 1.809 |
+| assign d=8, default, 64 threads | 0.92 | 0.54 | 1.642 |
+| train d=8, `always_gemm(true)`, 1 thread | 58.21 | 51.15 | 1.123 |
+| train d=8, `always_gemm(true)`, 8 threads | 13.89 | 12.39 | 1.111 |
+| train d=8, `always_gemm(true)`, 64 threads | 33.50 | 40.00 | 0.833 |
+| assign d=8, `always_gemm(true)`, 1 thread | 11.16 | 10.41 | 1.072 |
+| assign d=8, `always_gemm(true)`, 64 threads | 0.51 | 0.46 | 1.113 |
 
 The 8- and 32-thread assign cells and the 32-thread train cells are in the full `otto h2h` output; they are printed,
 not gated. At d=8 the default kernel is slower than `emeans` because it keeps the exact difference form (see the
 limit above); `always_gemm(true)` is the speed-parity path.
 
-Before and after, the same `otto h2h` ratios (ours / emeans). v0.1.0 is the first run, on the `v0.1.0` release
-(`5f0b62d`, 2026-11-13), which had no `always_gemm` option. v0.2.0 is the table above.
+Release over release, the same `otto h2h` ratios (ours / emeans). v0.1.0 is the first run, on the `v0.1.0` release
+(`5f0b62d`, 2026-11-13), which had no `always_gemm` option. v0.2.0 is the run recorded at that release (2026-11-14).
+v0.2.1 is the table above. Results are bitwise the same from v0.2.0 to v0.2.1.
 
-| cell | v0.1.0 | v0.2.0 |
-|---|---|---|
-| train d=32, 1 thread | 1.648 | 1.050 |
-| train d=32, 8 threads | 2.031 | 0.985 |
-| train d=32, 64 threads | 1.554 | 0.926 |
-| assign d=32, 1 thread | 1.808 | 1.074 |
-| assign d=32, 64 threads | 2.900 | 1.194 |
-| train d=8, default, 1 thread | 4.408 | 1.593 |
-| train d=8, default, 8 threads | 5.844 | 1.348 |
-| train d=8, default, 64 threads | 2.243 | 0.947 |
-| assign d=8, default, 1 thread | 4.442 | 1.922 |
-| assign d=8, default, 64 threads | 4.549 | 1.644 |
-| train d=8, `always_gemm(true)`, 1 thread | n/a | 1.152 |
-| train d=8, `always_gemm(true)`, 8 threads | n/a | 1.045 |
-| train d=8, `always_gemm(true)`, 64 threads | n/a | 0.830 |
-| assign d=8, `always_gemm(true)`, 1 thread | n/a | 1.099 |
-| assign d=8, `always_gemm(true)`, 64 threads | n/a | 1.181 |
+| cell | v0.1.0 | v0.2.0 | v0.2.1 |
+|---|---|---|---|
+| train d=32, 1 thread | 1.648 | 1.050 | 1.050 |
+| train d=32, 8 threads | 2.031 | 0.985 | 0.931 |
+| train d=32, 64 threads | 1.554 | 0.926 | 0.772 |
+| assign d=32, 1 thread | 1.808 | 1.074 | 1.024 |
+| assign d=32, 64 threads | 2.900 | 1.194 | 1.128 |
+| train d=8, default, 1 thread | 4.408 | 1.593 | 1.541 |
+| train d=8, default, 8 threads | 5.844 | 1.348 | 1.433 |
+| train d=8, default, 64 threads | 2.243 | 0.947 | 0.990 |
+| assign d=8, default, 1 thread | 4.442 | 1.922 | 1.809 |
+| assign d=8, default, 64 threads | 4.549 | 1.644 | 1.642 |
+| train d=8, `always_gemm(true)`, 1 thread | n/a | 1.152 | 1.123 |
+| train d=8, `always_gemm(true)`, 8 threads | n/a | 1.045 | 1.111 |
+| train d=8, `always_gemm(true)`, 64 threads | n/a | 0.830 | 0.833 |
+| assign d=8, `always_gemm(true)`, 1 thread | n/a | 1.099 | 1.072 |
+| assign d=8, `always_gemm(true)`, 64 threads | n/a | 1.181 | 1.113 |
+
+The 8-thread train cells swing run to run (1.32-1.67 over 20 runs of the d=8 default cell during the v0.2.0 work), so
+read a difference of that size between two columns as noise.
 
 ## Development
 
