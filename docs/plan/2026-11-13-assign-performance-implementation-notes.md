@@ -235,3 +235,19 @@ Status: implemented in the working tree on `d8b88b4`, `otto ci` green, NOT commi
 
 ### Open questions
 - None.
+
+## Phase 9: Re-measure, README
+### Design decisions
+- README Speed section rewritten from this run: `otto bench`, three `large-k` runs, and the gated `otto h2h` cells, each with its command and load average (`README.md`). The ungated 8- and 32-thread cells stay in the doc, not the README.
+- Acceptance Criteria checked off with "Observed at Phase 9" lines under each; the Phase 1 "Observed on main" lines kept as history (design doc).
+- Status flipped to Implemented (final phase).
+
+### Deviations
+- The README's old `NumpyEmeans` column was dropped, not refreshed: it came from the design author's data, cannot be reproduced here, and every README number must carry the command that produced it.
+- `otto bench` ran at load 5.18 at start, above the ~4 settle threshold: the load was the residue of the h2h run just before it (no other work on the machine), and the 15-minute average was 2.6. Criterion estimates are tight (worst interval [35.98, 38.16] ms).
+
+### Tradeoffs
+- Recording `otto h2h` once, all cells passing, vs re-running for a median of runs: the doc's rule is a single run with re-runs only on a miss; none missed.
+
+### Open questions
+- `train-d8-default-1t` passes at 1.605 against its 1.75 bound; the 8t d=8 cell read 1.429 (bound 1.8). Headroom is fine on an idle machine; the 2026-11-14 note that a loaded machine reads thinner still holds.
