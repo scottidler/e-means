@@ -532,6 +532,16 @@ Bit-neutrality arguments:
   - The README Speed section carries these numbers, the large-k runs and the h2h grid (the gated cells), each with its command.
   - The README's old `NumpyEmeans` column (measured on the design author's data, not reproducible here) was dropped.
 
+#### Post-audit addendum (2026-11-14): fused Gemm L2 scan
+
+- Source: a comparison against `emeans` 0.1.1 after the implementation audit found one bit-neutral idea worth taking: score and argmin in one pass (`emeans` `knn.rs:241-315`). Today's Gemm L2 path wrote clamped scores back into the tile, then `lane_scan` re-read them. Scott: adopt before the release (option A).
+- Change (`src/assign.rs`, `lane_scan_l2`): each 16-lane group's `row_norm + norm - 2*p`, clamped at `+0.0`, is staged in a local `[f32; LANES]`, then the same strict-`<` lane compare and the same merge rule run. Same per-element value, same comparisons, so change 1's argument holds unchanged. A one-loop version (compute, clamp, compare, select) de-vectorized and ran 3.6-5.6x slower; the staged form is the fast one.
+- Evidence: `otto ci` exit 0; `cargo test --release --test parity` 12 passed (oracles, golden digests, determinism); `rg -c` unsafe `src/assign.rs:1`. Mutations, run once and restored: tail `<` -> `<=` fails 5 tests (`tie_in_the_tail_goes_to_the_lower` among them); lane merge `lane_id < best_id` -> `>` fails 3 (`tie_between_two_lanes_goes_to_the_lower` among them).
+- Large-k (load 1.97): `train` 0.625, 0.603, 0.608 s; peak 151960, 144740, 151616 KB; digest `440bf89bb2f83d80`.
+- Full `otto h2h`, load 1.98 at start, exit 0, every gated cell within its bound. Gemm cells against Phase 9: train-d32 1t 1.109 -> 1.050, 8t 1.065 -> 0.985, 64t 0.891 -> 0.926; assign-d32 1t 1.049 -> 1.074, 64t 1.252 -> 1.194; train-d8-gemm 1t 1.239 -> 1.152, 8t 1.147 -> 1.045, 64t 0.870 -> 0.830; assign-d8-gemm 1t 1.196 -> 1.099, 64t 1.201 -> 1.181. Direct cells unchanged within noise (train-d8-default 1t 1.593, 8t 1.348, 64t 0.947; assign-d8-default 1t 1.922, 64t 1.644).
+- `otto bench` (load 3.74): assign gemm_d8 570.5 us (-7.5%), gemm_d32 785.7 us (-7.4%); train d32 21.47 ms, d8 36.83 ms. README Speed section replaced with this run.
+- Not taken from the same comparison: `emeans`' missing NaN check, `cn - 2 x.c` scan, xoshiro RNG, `BLOCK_ROWS = 128`, BLAS features (each breaks a constraint); folding `Model::assign`'s finite scan into the row-norm loop (2-4% at 1 thread) left for later; `from_centroids` and `accumulate_labeled` stay parked.
+
 ## Acceptance Criteria
 
 - [x] `otto ci; echo $?` prints 0 on `main`.

@@ -205,15 +205,7 @@ fn gemm_nearest(
         match metric {
             Metric::L2 => {
                 for (i, (products, (label, distance))) in per_row.enumerate() {
-                    let row_norm = row_norms[i];
-                    for (product, &centroid_norm) in products.iter_mut().zip(&norms[j0..j1]) {
-                        let mut expanded = row_norm + centroid_norm - 2.0 * *product;
-                        if expanded < 0.0 {
-                            expanded = 0.0;
-                        }
-                        *product = expanded;
-                    }
-                    let (id, best) = lane_scan(products, worst, |v, best| v < best);
+                    let (id, best) = lane_scan_l2(products, &norms[j0..j1], row_norms[i]);
                     if best < *distance {
                         *label = j0 as u32 + id;
                         *distance = best;
@@ -231,6 +223,56 @@ fn gemm_nearest(
             }
         }
     }
+}
+
+/// `lane_scan` over the L2 scores `row_norm + norms[j] - 2 * products[j]`, clamped at 0, computed in the
+/// scan instead of stored first: the same per-element value, the same comparisons.
+fn lane_scan_l2(products: &[f32], norms: &[f32], row_norm: f32) -> (u32, f32) {
+    #[inline(always)]
+    fn expanded(row_norm: f32, centroid_norm: f32, product: f32) -> f32 {
+        let mut e = row_norm + centroid_norm - 2.0 * product;
+        if e < 0.0 {
+            e = 0.0;
+        }
+        e
+    }
+    let worst = f32::INFINITY;
+    let mut lane_best = [worst; LANES];
+    let mut lane_id = [0u32; LANES];
+    let (groups, tail) = products.as_chunks::<LANES>();
+    let (norm_groups, norm_tail) = norms.as_chunks::<LANES>();
+    let mut ids: [u32; LANES] = std::array::from_fn(|l| l as u32);
+    for (group, norm_group) in groups.iter().zip(norm_groups) {
+        let mut vals = [0.0f32; LANES];
+        for l in 0..LANES {
+            let e = row_norm + norm_group[l] - 2.0 * group[l];
+            vals[l] = if e < 0.0 { 0.0 } else { e };
+        }
+        for l in 0..LANES {
+            let v = vals[l];
+            let better = v < lane_best[l];
+            lane_best[l] = if better { v } else { lane_best[l] };
+            lane_id[l] = if better { ids[l] } else { lane_id[l] };
+            ids[l] += LANES as u32;
+        }
+    }
+    let base = (groups.len() * LANES) as u32;
+    let (mut best, mut best_id) = (worst, 0u32);
+    for l in 0..LANES {
+        let v = lane_best[l];
+        if v < best || (v == best && v != worst && lane_id[l] < best_id) {
+            best = v;
+            best_id = lane_id[l];
+        }
+    }
+    for (offset, (&p, &cn)) in tail.iter().zip(norm_tail).enumerate() {
+        let v = expanded(row_norm, cn, p);
+        if v < best {
+            best = v;
+            best_id = base + offset as u32;
+        }
+    }
+    (best_id, best)
 }
 
 /// The first index of the best score in `scores`, and that score, where `better(v, best)` is the strict

@@ -270,3 +270,17 @@ Panel round 1 (synthesis `~/.cache/review-panel/runs/F2xeVPFX/synthesis.md`): 0 
 
 ### Open questions
 - None.
+
+## Post-audit: fused Gemm L2 scan (2026-11-14)
+
+### Design decisions
+- `lane_scan_l2` (`src/assign.rs`) replaces the clamp-and-store loop plus `lane_scan` on the Gemm L2 path; IP still uses `lane_scan`. Scott chose to ship it in this release (option A). Evidence in the design doc's post-audit addendum.
+
+### Deviations
+- Not in the original plan: added after the audit from the `emeans` comparison. Bit-neutral by change 1's argument (same per-element score, same strict comparisons and merge rule).
+
+### Tradeoffs
+- Staged `[f32; LANES]` per group vs one fused compare-select loop: the one-loop form de-vectorized (3.6-5.6x slower, measured in the comparison's scratch).
+
+### Open questions
+- None.

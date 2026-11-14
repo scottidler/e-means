@@ -122,44 +122,45 @@ worst of 20 e-means seeds (57.585) lost to Lloyd-25 (57.430) on the same rows.
 
 ## Speed
 
-Measured on a 64-thread machine (Threadripper 9970X), 2026-11-14, at commit `110d271`. Load average (1 min) at the
-start of each run is given with it. Every number is from the command beside it; rerun them to compare on your hardware.
+Measured on a 64-thread machine (Threadripper 9970X), 2026-11-14, on the release tree (fused Gemm L2 scan included).
+Load average (1 min) at the start of each run is given with it. Every number is from the command beside it; rerun them
+to compare on your hardware.
 
-`otto bench` (criterion, median of the interval; load 5.18 at start):
+`otto bench` (criterion, median of the interval; load 3.74 at start):
 
 | bench | kernel | this crate |
 |---|---|---|
-| train n=100000 d=32 k=256 T=5 (B=8192) | Gemm | 21.68 ms |
-| train n=100000 d=8 k=256 T=5 (B=1024) | Direct | 37.00 ms |
-| assign 100000 rows d=8 k=256 | Direct | 824.6 us |
-| assign 100000 rows d=8 k=256 | Gemm | 621.9 us |
-| assign 100000 rows d=32 k=256 | Direct | 2.209 ms |
-| assign 100000 rows d=32 k=256 | Gemm | 856.3 us |
+| train n=100000 d=32 k=256 T=5 (B=8192) | Gemm | 21.47 ms |
+| train n=100000 d=8 k=256 T=5 (B=1024) | Direct | 36.83 ms |
+| assign 100000 rows d=8 k=256 | Direct | 829.5 us |
+| assign 100000 rows d=8 k=256 | Gemm | 570.5 us |
+| assign 100000 rows d=32 k=256 | Direct | 2.165 ms |
+| assign 100000 rows d=32 k=256 | Gemm | 785.7 us |
 
 Large k, `/usr/bin/time -f "%M KB" target/release/examples/large-k` (n=200000, d=32, k=65536, T=1, 64 threads; `train`
-time printed by the example, load 3.45 to 4.38; 3 runs): 0.658, 0.642, 0.643 s; peak RSS 152368, 150996, 149132 KB.
+time printed by the example, load 1.97 at start; 3 runs): 0.625, 0.603, 0.608 s; peak RSS 151960, 144740, 151616 KB.
 Before the tiling work, the same example took 4.2-4.5 s and 2.2 GB.
 
-Against the `emeans` 0.1.1 crate, `otto h2h` (load 4.03 at start; ratio = median of 15 interleaved paired ratios, ours
+Against the `emeans` 0.1.1 crate, `otto h2h` (load 1.98 at start; ratio = median of 15 interleaved paired ratios, ours
 / emeans, so below 1 is faster than `emeans`; 1-thread cells pinned with `taskset -c 2`; ms are medians):
 
 | cell | ours ms | emeans ms | ratio |
 |---|---|---|---|
-| train d=32, 1 thread | 103.15 | 93.32 | 1.109 |
-| train d=32, 8 threads | 20.58 | 19.07 | 1.065 |
-| train d=32, 64 threads | 22.03 | 24.90 | 0.891 |
-| assign d=32, 1 thread | 18.63 | 17.79 | 1.049 |
-| assign d=32, 64 threads | 1.01 | 0.82 | 1.252 |
-| train d=8, default, 1 thread | 82.98 | 51.82 | 1.605 |
-| train d=8, default, 8 threads | 17.97 | 11.82 | 1.429 |
-| train d=8, default, 64 threads | 40.07 | 40.62 | 0.992 |
-| assign d=8, default, 1 thread | 18.39 | 9.55 | 1.922 |
-| assign d=8, default, 64 threads | 0.79 | 0.50 | 1.630 |
-| train d=8, `always_gemm(true)`, 1 thread | 61.10 | 49.12 | 1.239 |
-| train d=8, `always_gemm(true)`, 8 threads | 13.18 | 11.16 | 1.147 |
-| train d=8, `always_gemm(true)`, 64 threads | 35.11 | 40.44 | 0.870 |
-| assign d=8, `always_gemm(true)`, 1 thread | 12.58 | 10.53 | 1.196 |
-| assign d=8, `always_gemm(true)`, 64 threads | 0.58 | 0.49 | 1.201 |
+| train d=32, 1 thread | 95.98 | 92.46 | 1.050 |
+| train d=32, 8 threads | 19.97 | 19.32 | 0.985 |
+| train d=32, 64 threads | 21.70 | 23.11 | 0.926 |
+| assign d=32, 1 thread | 17.35 | 16.16 | 1.074 |
+| assign d=32, 64 threads | 0.78 | 0.66 | 1.194 |
+| train d=8, default, 1 thread | 82.68 | 52.14 | 1.593 |
+| train d=8, default, 8 threads | 17.07 | 12.50 | 1.348 |
+| train d=8, default, 64 threads | 40.27 | 42.03 | 0.947 |
+| assign d=8, default, 1 thread | 18.42 | 9.59 | 1.922 |
+| assign d=8, default, 64 threads | 0.80 | 0.48 | 1.644 |
+| train d=8, `always_gemm(true)`, 1 thread | 57.11 | 49.19 | 1.152 |
+| train d=8, `always_gemm(true)`, 8 threads | 16.78 | 12.44 | 1.045 |
+| train d=8, `always_gemm(true)`, 64 threads | 33.64 | 40.52 | 0.830 |
+| assign d=8, `always_gemm(true)`, 1 thread | 11.60 | 10.55 | 1.099 |
+| assign d=8, `always_gemm(true)`, 64 threads | 0.54 | 0.46 | 1.181 |
 
 The 8- and 32-thread assign cells and the 32-thread train cells are in the full `otto h2h` output; they are printed,
 not gated. At d=8 the default kernel is slower than `emeans` because it keeps the exact difference form (see the
