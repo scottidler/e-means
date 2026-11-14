@@ -251,3 +251,22 @@ Status: implemented in the working tree on `d8b88b4`, `otto ci` green, NOT commi
 
 ### Open questions
 - `train-d8-default-1t` passes at 1.605 against its 1.75 bound; the 8t d=8 cell read 1.429 (bound 1.8). Headroom is fine on an idle machine; the 2026-11-14 note that a loaded machine reads thinner still holds.
+
+## Implementation audit (2026-11-14): superseded entries
+
+Panel round 1 (synthesis `~/.cache/review-panel/runs/F2xeVPFX/synthesis.md`): 0 must-fix; v0.1.0 vs `8af7391` differential probes byte-identical at 1, 8 and 64 threads. Its one cheap win: entries above that read as live are superseded. This file is append-only, so they are marked here:
+
+- Phase 3 open question "Confirm 2^18 over 2^16": closed by the Phase 3 orchestrator addendum (2^18 kept by the doc's rule).
+- Phase 7 "Status: ... NOT committed" and its open questions (8t bound, 1t cell): closed by the Phase 7 orchestrator addendum (Scott, option A; committed as `86428d5`).
+
+### Design decisions
+- None.
+
+### Deviations
+- None.
+
+### Tradeoffs
+- None.
+
+### Open questions
+- None.

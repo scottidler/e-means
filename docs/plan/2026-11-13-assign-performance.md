@@ -454,7 +454,7 @@ Bit-neutrality arguments:
   - Determinism test, Phase 1 golden digests and `assign_over_many_blocks_is_thread_count_invariant` pass.
   - A unit test asserts the split rule: 4 blocks at 8 threads -> 16 tasks; 4 blocks at 64 threads -> 4 tasks; 32 blocks at 8 threads -> 32 tasks; 8 blocks at 8 threads -> 8 tasks (blocks == threads, no split); 4 blocks at 32 threads -> 16 tasks and at 33 -> 4 (the `SPLIT_MAX_THREADS` edge); 300 rows at 8 threads -> 5 tasks (one 256-row block as 4, the 44-row block as 1).
   - `otto h2h --cell train-d8-default-8t; echo $?` prints 0 (bound 1.8x after the 2026-11-14 reset; originally 1.35x). The whole grid exits 0 only at Phase 9, after `always_gemm` exists.
-- **Recorded in Phase 7, 2026-11-13. Implementation in the working tree on `d8b88b4`, NOT committed: the 8t gate misses.**
+- **Recorded in Phase 7, 2026-11-13. Implementation in the working tree on `d8b88b4`, NOT committed: the 8t gate misses.** (Superseded 2026-11-14: committed as `86428d5` after the bound reset; see the gate line below and Resolved Decisions.)
   - Determinism, golden digests, `assign_over_many_blocks_is_thread_count_invariant`: pass (`cargo test --release --test parity` 11 passed). Split-rule unit test passes all seven cases. `otto ci` exit 0 (152 lib tests). `rg -c` unsafe: `src/assign.rs:1`.
   - Gate: `otto h2h --cell train-d8-default-8t` exits 1. Ratios over 20 runs of the cell (load 1.5-4.1): 1.662, 1.497, 1.324 (the one pass), 1.449, 1.365, 1.532, 1.413, 1.467, 1.373, 1.629, 1.649, 1.485, 1.367, 1.352, 1.567, 1.666, 1.455, 1.594, 1.482, 1.459. Ours 21-25 ms, emeans 12-16.5 ms.
   - Full `otto h2h`, load 2.50 at start, 2.17 at end, exit 1 (ratio = median of 15 paired ratios; ms are medians):
