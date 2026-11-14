@@ -10,6 +10,7 @@ repository = "https://github.com/scottidler/e-means"
 log = "0.4.35"
 rand_chacha = "0.10.0"
 rand_core = "0.10.1"
+rayon = "1.12.0"
 thiserror = "2.0.21"
 
 [dev-dependencies]

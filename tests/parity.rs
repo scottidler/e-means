@@ -296,14 +296,21 @@ fn inputs(fx: &Fixture) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
     (x, init, orders)
 }
 
-/// Replay the Faiss run through the caller-driven trainer: Faiss's init, Faiss's pass orders.
+/// Replay the Faiss run through the caller-driven trainer: Faiss's init, Faiss's pass orders, one
+/// `accumulate` per logical batch.
 fn rust_run(fx: &Fixture) -> Run {
     let (x, init, orders) = inputs(fx);
+    rust_run_chunked(fx, &x, &init, &orders, &[usize::MAX])
+}
+
+/// `rust_run` on prepared inputs, each logical batch fed in chunks whose row counts cycle through `chunks`
+/// (`[usize::MAX]` = the whole batch in one chunk), on the current `rayon` pool.
+fn rust_run_chunked(fx: &Fixture, x: &[f32], init: &[f32], orders: &[u32], chunks: &[usize]) -> Run {
     let mut trainer = EMeans::new(fx.d, fx.k)
         .epochs(fx.epochs)
         .unused_threshold(fx.unused_threshold)
         .spherical(fx.spherical)
-        .begin(fx.n, &init)
+        .begin(fx.n, init)
         .unwrap_or_else(|e| panic!("{}: begin: {e}", fx.name));
 
     let recipe = trainer.recipe();
@@ -324,9 +331,16 @@ fn rust_run(fx: &Fixture) -> Run {
                 let i = i as usize;
                 rows.extend_from_slice(&x[i * fx.d..(i + 1) * fx.d]);
             }
-            trainer
-                .accumulate(&rows)
-                .unwrap_or_else(|e| panic!("{}: accumulate: {e}", fx.name));
+            let mut rest = &rows[..];
+            let mut sizes = chunks.iter().cycle();
+            while !rest.is_empty() {
+                let size = sizes.next().expect("chunks is not empty");
+                let (chunk, tail) = rest.split_at((*size).min(rest.len() / fx.d) * fx.d);
+                trainer
+                    .accumulate(chunk)
+                    .unwrap_or_else(|e| panic!("{}: accumulate: {e}", fx.name));
+                rest = tail;
+            }
             trainer.update().unwrap_or_else(|e| panic!("{}: update: {e}", fx.name));
         }
         trainer
@@ -496,4 +510,51 @@ fn large_d32_k256_revival_smoke() {
         "large_revival: final-pass objective off by {:e} > {REVIVAL_OBJECTIVE_BOUND:e}",
         m.objective
     );
+}
+
+/// Bitwise view of a run, for equality across pools and chunkings.
+fn run_bits(run: &Run) -> (Vec<u32>, &[u32], Vec<u64>, &[usize]) {
+    (
+        run.centroids.iter().map(|c| c.to_bits()).collect(),
+        &run.labels,
+        run.objectives.iter().map(|o| o.to_bits()).collect(),
+        &run.splits,
+    )
+}
+
+// Design criterion (Phase 8): a 1-thread and an 8-thread pool give bitwise equal centroids, labels and
+// objective on every fixture; so do row-at-a-time chunks and chunks of 3, 5, 7 rows on the 8-thread pool.
+#[test]
+fn determinism_across_thread_counts_and_chunkings() {
+    let one = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("1-thread pool");
+    let eight = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .expect("8-thread pool");
+    let whole: &[usize] = &[usize::MAX];
+    for fx in manifest().fixtures {
+        let (x, init, orders) = inputs(&fx);
+        let reference = one.install(|| rust_run_chunked(&fx, &x, &init, &orders, whole));
+        let faiss = faiss_run(&fx);
+        let m = metrics(&fx, &reference, &faiss);
+        println!(
+            "{}: 1 thread vs faiss: centroid {:.3e} objective {:.3e} labels {:.4}%",
+            fx.name,
+            m.centroid,
+            m.objective,
+            100.0 * m.labels
+        );
+        for chunks in [whole, &[1], &[3, 5, 7]] {
+            let run = eight.install(|| rust_run_chunked(&fx, &x, &init, &orders, chunks));
+            assert_eq!(
+                run_bits(&run),
+                run_bits(&reference),
+                "{}: 8 threads, chunks {chunks:?} differ from 1 thread, whole batches",
+                fx.name
+            );
+        }
+    }
 }

@@ -6,6 +6,7 @@
 //! `:512-529`.
 
 use log::{debug, trace};
+use rayon::prelude::*;
 
 use crate::assign::{self, Kernel, Metric};
 use crate::error::{Error, Result};
@@ -202,25 +203,43 @@ impl Trainer {
         if self.received() == 0 && self.metric == Metric::L2 {
             self.snapshot.copy_from_slice(&self.centroids);
         }
+        let d = self.d;
+        let mut carry = std::mem::take(&mut self.carry);
         let mut rest = rows;
-        while !rest.is_empty() {
-            let block_len = BLOCK_ROWS.min(due - self.batch.assigned);
-            let waiting = self.carry.len() / self.d;
-            let take = (block_len - waiting).min(rest.len() / self.d);
-            let (head, tail) = rest.split_at(take * self.d);
-            if waiting == 0 && take == block_len {
-                self.assign_block(head);
-            } else {
-                self.carry.extend_from_slice(head);
-                if waiting + take == block_len {
-                    let carry = std::mem::take(&mut self.carry);
-                    self.assign_block(&carry);
-                    self.carry = carry;
-                    self.carry.clear();
-                }
-            }
+        // Batch row where the next block starts; blocks are cut relative to the batch start.
+        let mut cursor = self.batch.assigned;
+        let mut carry_complete = false;
+        if !carry.is_empty() {
+            let block_len = BLOCK_ROWS.min(due - cursor);
+            let take = (block_len - carry.len() / d).min(rest.len() / d);
+            let (head, tail) = rest.split_at(take * d);
+            carry.extend_from_slice(head);
             rest = tail;
+            if carry.len() / d == block_len {
+                carry_complete = true;
+                cursor += block_len;
+            }
         }
+        let mut blocks: Vec<&[f32]> = Vec::new();
+        if carry_complete {
+            blocks.push(&carry);
+        }
+        while cursor < due {
+            let block_len = BLOCK_ROWS.min(due - cursor);
+            if rest.len() / d < block_len {
+                break;
+            }
+            let (head, tail) = rest.split_at(block_len * d);
+            blocks.push(head);
+            rest = tail;
+            cursor += block_len;
+        }
+        self.assign_blocks(&blocks);
+        if carry_complete {
+            carry.clear();
+        }
+        carry.extend_from_slice(rest);
+        self.carry = carry;
         Ok(())
     }
 
@@ -429,43 +448,70 @@ impl Trainer {
         Ok(())
     }
 
-    /// Assign one block against the snapshot, then add it to the batch in row order on this thread.
-    fn assign_block(&mut self, block: &[f32]) {
-        let rows = block.len() / self.d;
-        self.block_labels.resize(rows, 0);
-        self.block_scores.resize(rows, 0.0);
-        assign::nearest(
-            self.kernel,
-            self.metric,
-            block,
-            &self.snapshot,
-            self.d,
-            &mut self.block_labels,
-            &mut self.block_scores,
-        );
-        if self.metric == Metric::InnerProduct {
-            // `2 - 2 * ip` per row, as `2 * rows` plus the f32 values `-2 * ip` (`REF/e_means.py:432-434`).
-            self.batch.objective += 2.0 * rows as f64;
+    /// Assign complete blocks against the snapshot, one block per task on the current `rayon` pool, then add
+    /// them to the batch in row order on this thread.
+    ///
+    /// A block's labels and scores depend only on its rows and the snapshot, and the counts, sums and
+    /// objective are added sequentially in row order, so neither the thread count nor how the rows arrived
+    /// changes a bit of the result.
+    fn assign_blocks(&mut self, blocks: &[&[f32]]) {
+        if blocks.is_empty() {
+            return;
         }
-        for ((row, &label), &score) in block
-            .chunks_exact(self.d)
-            .zip(&self.block_labels)
-            .zip(&self.block_scores)
-        {
-            let j = label as usize;
-            self.batch.counts[j] += 1;
-            for (s, &x) in self.batch.sums[j * self.d..(j + 1) * self.d].iter_mut().zip(row) {
-                *s += f64::from(x);
+        let d = self.d;
+        let total: usize = blocks.iter().map(|block| block.len() / d).sum();
+        trace!("Trainer::assign_blocks: blocks={} rows={total}", blocks.len());
+        let mut labels = std::mem::take(&mut self.block_labels);
+        let mut scores = std::mem::take(&mut self.block_scores);
+        labels.resize(total, 0);
+        scores.resize(total, 0.0);
+
+        let mut jobs = Vec::with_capacity(blocks.len());
+        let (mut free_labels, mut free_scores) = (&mut labels[..], &mut scores[..]);
+        for &block in blocks {
+            let rows = block.len() / d;
+            let (block_labels, rest_labels) = std::mem::take(&mut free_labels).split_at_mut(rows);
+            let (block_scores, rest_scores) = std::mem::take(&mut free_scores).split_at_mut(rows);
+            jobs.push((block, block_labels, block_scores));
+            free_labels = rest_labels;
+            free_scores = rest_scores;
+        }
+        let (kernel, metric, snapshot) = (self.kernel, self.metric, &self.snapshot);
+        jobs.into_par_iter().for_each(|(block, block_labels, block_scores)| {
+            assign::nearest(kernel, metric, block, snapshot, d, block_labels, block_scores);
+        });
+
+        let mut at = 0;
+        for &block in blocks {
+            let rows = block.len() / d;
+            if self.metric == Metric::InnerProduct {
+                // `2 - 2 * ip` per row, as `2 * rows` per block plus the f32 values `-2 * ip`
+                // (`REF/e_means.py:432-434`).
+                self.batch.objective += 2.0 * rows as f64;
             }
-            self.batch.objective += match self.metric {
-                Metric::L2 => f64::from(score),
-                Metric::InnerProduct => f64::from(-2.0 * score),
-            };
+            for ((row, &label), &score) in block
+                .chunks_exact(d)
+                .zip(&labels[at..at + rows])
+                .zip(&scores[at..at + rows])
+            {
+                let j = label as usize;
+                self.batch.counts[j] += 1;
+                for (s, &x) in self.batch.sums[j * d..(j + 1) * d].iter_mut().zip(row) {
+                    *s += f64::from(x);
+                }
+                self.batch.objective += match self.metric {
+                    Metric::L2 => f64::from(score),
+                    Metric::InnerProduct => f64::from(-2.0 * score),
+                };
+            }
+            at += rows;
         }
-        if let Some(labels) = self.pass_labels.as_mut() {
-            labels.extend_from_slice(&self.block_labels);
+        if let Some(pass_labels) = self.pass_labels.as_mut() {
+            pass_labels.extend_from_slice(&labels);
         }
-        self.batch.assigned += rows;
+        self.batch.assigned += total;
+        self.block_labels = labels;
+        self.block_scores = scores;
     }
 
     /// Algorithm 1 line 8: the EMA of masses and centroids (`REF/e_means.py:456-505`).

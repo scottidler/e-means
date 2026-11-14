@@ -129,3 +129,33 @@ fn spherical_assign_returns_two_minus_two_ip() {
     );
     assert_eq!(assignment.distances, [2.0 - 2.0 * 0.8f32, 2.0, 2.0]);
 }
+
+// Phase 8: blocks run in parallel; the result matches a serial pass and does not depend on the thread count
+#[test]
+fn assign_over_many_blocks_is_thread_count_invariant() {
+    let model = two_cluster_model();
+    let n = 3 * BLOCK_ROWS + 17;
+    let rows: Vec<f32> = (0..n * 2).map(|i| ((i * 7919) % 23) as f32 * 0.5).collect();
+    let mut serial_labels = vec![0; n];
+    let mut serial_distances = vec![0.0; n];
+    crate::assign::nearest(
+        Kernel::Direct,
+        Metric::L2,
+        &rows,
+        model.centroids(),
+        2,
+        &mut serial_labels,
+        &mut serial_distances,
+    );
+    for threads in [1, 8] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let assignment = pool.install(|| model.assign(&rows)).unwrap();
+        assert_eq!(assignment.labels, serial_labels, "threads {threads}");
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&assignment.distances),
+            bits(&serial_distances),
+            "threads {threads}"
+        );
+    }
+}

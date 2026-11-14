@@ -2,10 +2,12 @@
 //! them, plus final-nearest assignment.
 
 use log::debug;
+use rayon::prelude::*;
 
 use crate::assign::{self, Kernel, Metric};
 use crate::error::{Error, Result};
 use crate::recipe::Recipe;
+use crate::trainer::BLOCK_ROWS;
 
 /// Statistics of one pass, recorded by `Trainer::end_epoch`.
 #[derive(Debug, Clone, PartialEq)]
@@ -117,15 +119,21 @@ impl Model {
         let n = rows.len() / self.d;
         let mut labels = vec![0; n];
         let mut distances = vec![0.0; n];
-        assign::nearest(
-            self.kernel,
-            self.metric,
-            rows,
-            &self.centroids,
-            self.d,
-            &mut labels,
-            &mut distances,
-        );
+        // One block per task on the current `rayon` pool; each row's result depends only on the row.
+        rows.par_chunks(BLOCK_ROWS * self.d)
+            .zip(labels.par_chunks_mut(BLOCK_ROWS))
+            .zip(distances.par_chunks_mut(BLOCK_ROWS))
+            .for_each(|((block, block_labels), block_distances)| {
+                assign::nearest(
+                    self.kernel,
+                    self.metric,
+                    block,
+                    &self.centroids,
+                    self.d,
+                    block_labels,
+                    block_distances,
+                );
+            });
         if self.metric == Metric::InnerProduct {
             for distance in &mut distances {
                 *distance = 2.0 - 2.0 * *distance;
