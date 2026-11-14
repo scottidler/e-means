@@ -1,0 +1,11 @@
+[package]
+name = "e-means"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Rust port of the e-means streaming k-means trainer from Faiss"
+repository = "https://github.com/scottidler/e-means"
+
+[dependencies]
+log = "0.4.35"
+thiserror = "2.0.21"
