@@ -5,5 +5,6 @@
 #![deny(unused_variables)]
 
 mod error;
+pub mod recipe;
 
 pub use error::{Error, Result};
