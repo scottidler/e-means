@@ -30,10 +30,6 @@ const PAIRS: usize = 15;
 /// The core a 1-thread cell is pinned to.
 const PIN_CORE: &str = "2";
 
-/// Whether `e_means::EMeans::always_gemm` exists. Phase 8 adds it; until then the `always_gemm` cells print
-/// `n/a` and are not gated. Flip this and wire the builder call in `ours_builder` in that phase.
-const OURS_HAS_ALWAYS_GEMM: bool = false;
-
 const THREADS: [usize; 4] = [1, 8, 32, 64];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,12 +106,7 @@ struct Cell {
     bound: Option<f64>,
 }
 
-impl Cell {
-    /// Whether ours can run this cell yet.
-    fn available(&self) -> bool {
-        !self.always_gemm || OURS_HAS_ALWAYS_GEMM
-    }
-}
+impl Cell {}
 
 fn cells() -> Vec<Cell> {
     GRID.iter()
@@ -184,13 +175,7 @@ fn mixture(d: usize, seed: u64) -> Vec<f32> {
 
 fn ours_builder(cell: &Cell) -> e_means::EMeans {
     let builder = e_means::EMeans::new(cell.d, K).epochs(EPOCHS).seed(DATA_SEED);
-    // Phase 8: `if cell.always_gemm { builder.always_gemm(true) } else { builder }`.
-    assert!(
-        !cell.always_gemm || OURS_HAS_ALWAYS_GEMM,
-        "{}: ours has no always_gemm yet",
-        cell.name
-    );
-    builder
+    builder.always_gemm(cell.always_gemm)
 }
 
 fn theirs_builder(cell: &Cell) -> emeans::Emeans {
@@ -373,19 +358,9 @@ fn main() -> ExitCode {
         "{:<24} {:>10} {:>10} {:>7} {:>7}  verdict",
         "cell", "ours ms", "emeans ms", "ratio", "bound"
     );
-    let (mut misses, mut unavailable_named) = (0, 0);
+    let mut misses = 0;
     for cell in chosen {
         let bound = cell.bound.map_or("-".to_string(), |b| format!("<={b}"));
-        if !cell.available() {
-            println!(
-                "{:<24} {:>10} {:>10} {:>7} {:>7}  n/a (ours has no always_gemm yet)",
-                cell.name, "n/a", "n/a", "n/a", bound
-            );
-            if !args.cell.is_empty() {
-                unavailable_named += 1;
-            }
-            continue;
-        }
         let m = match measure_in_child(cell) {
             Ok(m) => m,
             Err(e) => {
@@ -410,10 +385,6 @@ fn main() -> ExitCode {
                 Verdict::Printed => "printed",
             }
         );
-    }
-    if unavailable_named > 0 {
-        eprintln!("h2h: {unavailable_named} named cell(s) cannot run yet, so none can be gated");
-        return ExitCode::FAILURE;
     }
     if misses > 0 {
         eprintln!("h2h: {misses} gated cell(s) missed their bound");
@@ -448,15 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn always_gemm_cells_are_unavailable_until_ours_has_the_option() {
-        for cell in cells() {
-            assert_eq!(
-                cell.available(),
-                !cell.always_gemm || OURS_HAS_ALWAYS_GEMM,
-                "{}",
-                cell.name
-            );
-        }
+    fn eight_always_gemm_cells_all_run() {
+        let gemm: Vec<_> = cells().into_iter().filter(|c| c.always_gemm).collect();
+        assert_eq!(gemm.len(), 8);
+        assert!(gemm.iter().all(|c| c.name.contains("-gemm-")), "named for the option");
     }
 
     #[test]

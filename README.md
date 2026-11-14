@@ -63,7 +63,8 @@ Above `B * d` = 128000 the assignment kernel uses a matrix multiply and the norm
 `||x||^2 + ||c||^2 - 2 x.c`. On data with a large common offset f32 cancellation picks the wrong centroid. Example:
 `x = 10000`, centroids `[10002, 10001]`: direct distances `[4, 1]`, expansion `[0, 0]`, tie to index 0, the wrong
 centroid. Faiss has the same limit above its BLAS threshold. Center such data first. Below the threshold the direct
-kernel is used and has no such limit.
+kernel is used and has no such limit. `EMeans::always_gemm(true)` opts into Gemm at every batch size for speed on small
+batches and takes the same offset limit.
 
 ## Deviations from the Faiss reference
 

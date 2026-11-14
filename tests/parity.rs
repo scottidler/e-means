@@ -306,10 +306,23 @@ fn rust_run(fx: &Fixture) -> Run {
 /// `rust_run` on prepared inputs, each logical batch fed in chunks whose row counts cycle through `chunks`
 /// (`[usize::MAX]` = the whole batch in one chunk), on the current `rayon` pool.
 fn rust_run_chunked(fx: &Fixture, x: &[f32], init: &[f32], orders: &[u32], chunks: &[usize]) -> Run {
+    rust_run_chunked_with(fx, x, init, orders, chunks, false)
+}
+
+/// `rust_run_chunked` with `always_gemm` set as given.
+fn rust_run_chunked_with(
+    fx: &Fixture,
+    x: &[f32],
+    init: &[f32],
+    orders: &[u32],
+    chunks: &[usize],
+    always_gemm: bool,
+) -> Run {
     let mut trainer = EMeans::new(fx.d, fx.k)
         .epochs(fx.epochs)
         .unused_threshold(fx.unused_threshold)
         .spherical(fx.spherical)
+        .always_gemm(always_gemm)
         .begin(fx.n, init)
         .unwrap_or_else(|e| panic!("{}: begin: {e}", fx.name));
 
@@ -557,6 +570,43 @@ fn determinism_across_thread_counts_and_chunkings() {
             );
         }
     }
+}
+
+// Phase 8 criterion: with `always_gemm(true)` on the d=8 fixtures (Direct by default), a 1-thread and an
+// 8-thread pool still give bitwise equal centroids, labels and objective, for whole batches and for every
+// chunking: the kernel is keyed on the builder, never on thread count or chunk size.
+#[test]
+fn always_gemm_determinism_on_d8_fixtures_across_threads_and_chunkings() {
+    let one = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("1-thread pool");
+    let eight = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .expect("8-thread pool");
+    let whole: &[usize] = &[usize::MAX];
+    let mut checked = 0;
+    for fx in manifest().fixtures.into_iter().filter(|fx| fx.d == 8) {
+        assert!(
+            fx.batch_size * fx.d < BLAS_THRESHOLD,
+            "{}: default kernel is Direct, so always_gemm changes it",
+            fx.name
+        );
+        let (x, init, orders) = inputs(&fx);
+        let reference = one.install(|| rust_run_chunked_with(&fx, &x, &init, &orders, whole, true));
+        for chunks in [whole, &[1], &[3, 5, 7]] {
+            let run = eight.install(|| rust_run_chunked_with(&fx, &x, &init, &orders, chunks, true));
+            assert_eq!(
+                run_bits(&run),
+                run_bits(&reference),
+                "{}: always_gemm, 8 threads, chunks {chunks:?} differ from 1 thread, whole batches",
+                fx.name
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "at least one d=8 fixture");
 }
 
 /// `BLAS_THRESHOLD` in `src/assign.rs`, which is crate-private: a fixture with `batch_size * d` below it

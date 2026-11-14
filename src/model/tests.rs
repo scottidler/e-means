@@ -233,3 +233,46 @@ fn model_keeps_the_kernel_picked_from_batch_times_d() {
         }
     }
 }
+
+// `always_gemm(true)` picks Gemm below the `B * d` threshold; the default keeps Direct (d=8, B=1024: 8192 < 128000).
+#[test]
+fn always_gemm_builder_picks_gemm_and_default_picks_direct() {
+    let (n, d, k) = (4096, 8, 4);
+    let x = separated_rows(n, d, k);
+    let init = x[..k * d].to_vec();
+    for (always, kernel) in [(false, Kernel::Direct), (true, Kernel::Gemm)] {
+        let model = crate::EMeans::new(d, k)
+            .epochs(2.0)
+            .batch_size(1024)
+            .always_gemm(always)
+            .train_from(&x, &init)
+            .unwrap();
+        assert_eq!(model.kernel, kernel, "always_gemm={always}");
+        let expected: Vec<u32> = (0..n).map(|i| (i % k) as u32).collect();
+        assert_eq!(model.assign(&x).unwrap().labels, expected, "always_gemm={always}");
+    }
+}
+
+// The README offset fixture through the builder: default (Direct) labels the row 1, `always_gemm(true)`
+// labels it 0, the documented limit. Tiny alpha0 keeps the trained centroids at their init.
+#[test]
+fn offset_fixture_through_builder_default_is_right_and_always_gemm_hits_the_limit() {
+    let x = [10000.0f32, 10000.0];
+    let init = [10002.0f32, 10001.0];
+    for (always, label) in [(false, 1u32), (true, 0u32)] {
+        let model = crate::EMeans::new(1, 2)
+            .epochs(1.0)
+            .batch_size(2)
+            .alpha0(1e-9)
+            .unused_threshold(0.0)
+            .always_gemm(always)
+            .train_from(&x, &init)
+            .unwrap();
+        assert_eq!(
+            model.assign(&[10000.0]).unwrap().labels,
+            [label],
+            "always_gemm={always}, centroids {:?}",
+            model.centroids()
+        );
+    }
+}

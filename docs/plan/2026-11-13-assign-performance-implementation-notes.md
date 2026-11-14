@@ -218,3 +218,20 @@ Status: implemented in the working tree on `d8b88b4`, `otto ci` green, NOT commi
 
 ### Open questions
 - None.
+
+## Phase 8: `always_gemm` opt-in
+### Design decisions
+- `EMeans::always_gemm(bool)` stored on `EMeans` (default false), in `src/config.rs`; `Trainer::new` picks `Kernel::Gemm` when set, `Kernel::for_batch(B, d)` otherwise (`src/trainer.rs`). `Model` already keeps the trainer's kernel, so `Model::assign` follows. Keyed on the builder only.
+- `bin/h2h`: removed `OURS_HAS_ALWAYS_GEMM`, `Cell::available` and the `n/a` path; `ours_builder` calls `.always_gemm(cell.always_gemm)`. No bound changed. The old `n/a` test became `eight_always_gemm_cells_all_run`.
+- Tests: `always_gemm_builder_picks_gemm_and_default_picks_direct` and `offset_fixture_through_builder_default_is_right_and_always_gemm_hits_the_limit` (`src/model/tests.rs`); `always_gemm_determinism_on_d8_fixtures_across_threads_and_chunkings` (`tests/parity.rs`, 1 vs 8 threads, whole/1/3-5-7 chunks).
+- Mutation check: the Gemm branch disabled (`always_gemm && false`) failed both new model tests; restored.
+- Measured (recorded in the design doc, gated at Phase 9): all 8 `always_gemm` cells within their Phase 9 bounds at load ~3.2 (train 1.238/1.106/0.902/0.853, assign 1.196/1.169/1.172/1.175).
+
+### Deviations
+- `Trainer::new` takes a `TrainerOptions { capture_labels, metric, always_gemm }` struct instead of a new positional `always_gemm` argument: an 8th argument trips `clippy::too_many_arguments` (limit 7). Same effect, correct seam.
+
+### Tradeoffs
+- A small options struct vs `#[allow(clippy::too_many_arguments)]`: the struct keeps the lint on for the crate.
+
+### Open questions
+- None.

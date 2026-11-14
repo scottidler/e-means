@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::Model;
 use crate::recipe::{BatchLaw, Recipe, RecipeSpec};
 use crate::rng::{Stream, StreamId};
-use crate::trainer::Trainer;
+use crate::trainer::{Trainer, TrainerOptions};
 
 /// The reference constructor's default seed (`REF/e_means.py:169`).
 const DEFAULT_SEED: u64 = 1234;
@@ -29,6 +29,7 @@ pub struct EMeans {
     max_points_per_centroid: Option<usize>,
     capture_labels: bool,
     spherical: bool,
+    always_gemm: bool,
 }
 
 impl EMeans {
@@ -46,6 +47,7 @@ impl EMeans {
             max_points_per_centroid: None,
             capture_labels: true,
             spherical: false,
+            always_gemm: false,
         }
     }
 
@@ -105,6 +107,13 @@ impl EMeans {
         self
     }
 
+    /// Use the Gemm kernel for every batch size, not only when `B * d >= 128000`. Faster for small
+    /// batches; gives the wrong centroid on data with a large common offset (see README). Default false.
+    pub fn always_gemm(mut self, always: bool) -> Self {
+        self.always_gemm = always;
+        self
+    }
+
     /// Train on `x` (row-major, `d` columns) from seeded initial centroids.
     ///
     /// Init is the first k rows of a seeded permutation, or the rows as given when n == k
@@ -131,7 +140,7 @@ impl EMeans {
     /// Every error is found before a trainer exists.
     pub fn begin(&self, n: usize, init: &[f32]) -> Result<Trainer> {
         debug!(
-            "EMeans::begin: n={n} d={} k={} epochs={} batch_law={:?} batch_size={:?} alpha0={:?} unused_threshold={:?} seed={} spherical={}",
+            "EMeans::begin: n={n} d={} k={} epochs={} batch_law={:?} batch_size={:?} alpha0={:?} unused_threshold={:?} seed={} spherical={} always_gemm={}",
             self.d,
             self.k,
             self.epochs,
@@ -140,7 +149,8 @@ impl EMeans {
             self.alpha0,
             self.unused_threshold,
             self.seed,
-            self.spherical
+            self.spherical,
+            self.always_gemm
         );
         self.validate_shape()?;
         if n < self.k {
@@ -177,8 +187,11 @@ impl EMeans {
             recipe,
             init,
             self.seed,
-            self.capture_labels,
-            if self.spherical { Metric::InnerProduct } else { Metric::L2 },
+            TrainerOptions {
+                capture_labels: self.capture_labels,
+                metric: if self.spherical { Metric::InnerProduct } else { Metric::L2 },
+                always_gemm: self.always_gemm,
+            },
         ))
     }
 
