@@ -70,6 +70,7 @@ fn golden_streams_are_distinct_per_use() {
     assert_eq!(first(StreamId::Pass(0)), 7751969689126549159);
     assert_eq!(first(StreamId::Init), 13412373498528894678);
     assert_eq!(first(StreamId::Revival), 7839892025930919283);
+    assert_eq!(first(StreamId::Subset), 17003396118023392089);
     assert_ne!(first(StreamId::Pass(1)), first(StreamId::Pass(0)));
     assert_ne!(
         Stream::new(1235, StreamId::Revival).next_u64(),

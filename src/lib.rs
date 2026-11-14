@@ -15,6 +15,6 @@ mod trainer;
 
 pub use config::EMeans;
 pub use error::{Error, Result};
-pub use model::{EpochStats, Model};
+pub use model::{Assignment, EpochStats, Model};
 pub use recipe::{BatchLaw, Recipe};
 pub use trainer::{BatchStats, Trainer};

@@ -1,5 +1,10 @@
-//! The trained model: final centroids, per-pass statistics and the recipe that produced them.
+//! The trained model: final centroids, last-pass labels, per-pass statistics and the recipe that produced
+//! them, plus final-nearest assignment.
 
+use log::debug;
+
+use crate::assign::{self, Kernel};
+use crate::error::{Error, Result};
 use crate::recipe::Recipe;
 
 /// Statistics of one pass, recorded by `Trainer::end_epoch`.
@@ -16,9 +21,20 @@ pub struct EpochStats {
     pub rows: usize,
 }
 
+/// Nearest final centroid of each row, from `Model::assign`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    /// Index of the nearest centroid per row; ties go to the lowest index.
+    pub labels: Vec<u32>,
+    /// Squared L2 distance from each row to its nearest centroid.
+    pub distances: Vec<f32>,
+}
+
 /// The result of a run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
+    d: usize,
+    kernel: Kernel,
     centroids: Vec<f32>,
     epoch_stats: Vec<EpochStats>,
     recipe: Recipe,
@@ -27,12 +43,16 @@ pub struct Model {
 
 impl Model {
     pub(crate) fn new(
+        d: usize,
+        kernel: Kernel,
         centroids: Vec<f32>,
         epoch_stats: Vec<EpochStats>,
         recipe: Recipe,
         labels: Option<Vec<Option<u32>>>,
     ) -> Self {
         Model {
+            d,
+            kernel,
             centroids,
             epoch_stats,
             recipe,
@@ -57,10 +77,55 @@ impl Model {
 
     /// Last-pass labels, captured against centroids that were still moving; not final-nearest.
     ///
-    /// On the caller-driven path they are in feed order (position within the last pass), all `Some`.
-    /// `None` when a last-pass batch was applied with `Trainer::update_with`, which carries no labels.
+    /// From `EMeans::train` they are in row order, one per input row; a row the last pass did not visit
+    /// (a fractional pass, or a row left out by `max_points_per_centroid`) is `None`. On the caller-driven
+    /// path they are in feed order (position within the last pass), all `Some`. The whole result is `None`
+    /// with `capture_labels(false)`, or when a last-pass batch was applied with `Trainer::update_with`,
+    /// which carries no labels.
     pub fn labels(&self) -> Option<&[Option<u32>]> {
         self.labels.as_deref()
+    }
+
+    /// Nearest final centroid of each row of `rows` (row-major, `d` columns), with the same kernel as the run.
+    ///
+    /// `Error::DimensionMismatch` when `rows` is not whole rows; `Error::NonFiniteInput` on a NaN or
+    /// infinite value, which would otherwise lose every comparison and land on centroid 0.
+    pub fn assign(&self, rows: &[f32]) -> Result<Assignment> {
+        debug!("Model::assign: values={} d={}", rows.len(), self.d);
+        if !rows.len().is_multiple_of(self.d) {
+            return Err(Error::DimensionMismatch(format!(
+                "{} values is not a whole number of rows of d={}",
+                rows.len(),
+                self.d
+            )));
+        }
+        if let Some(at) = rows.iter().position(|v| !v.is_finite()) {
+            return Err(Error::NonFiniteInput(format!(
+                "row {} column {} is {}",
+                at / self.d,
+                at % self.d,
+                rows[at]
+            )));
+        }
+        let n = rows.len() / self.d;
+        let mut labels = vec![0; n];
+        let mut distances = vec![0.0; n];
+        assign::nearest(self.kernel, rows, &self.centroids, self.d, &mut labels, &mut distances);
+        debug!("Model::assign: {n} rows assigned");
+        Ok(Assignment { labels, distances })
+    }
+
+    /// Move the labels from feed positions to rows: the label at position `p` becomes row `rows[p]`'s, of
+    /// `n` rows; rows no position names get `None`. No-op when labels were not captured.
+    pub(crate) fn scatter_labels(&mut self, rows: &[usize], n: usize) {
+        if let Some(fed) = self.labels.take() {
+            assert!(fed.len() <= rows.len(), "more labels than row positions");
+            let mut placed = vec![None; n];
+            for (&row, label) in rows.iter().zip(fed) {
+                placed[row] = label;
+            }
+            self.labels = Some(placed);
+        }
     }
 }
 

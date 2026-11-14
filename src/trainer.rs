@@ -65,8 +65,10 @@ pub struct Trainer {
     /// Rows of the current pass applied by `update`.
     pass_rows: usize,
     pass_splits: usize,
-    /// Last-pass labels in feed order; `None` outside the last pass or once `update_with` hides some rows.
+    /// Last-pass labels in feed order; `None` outside the last pass, with capture off, or once `update_with`
+    /// hides some rows.
     pass_labels: Option<Vec<u32>>,
+    capture_labels: bool,
     epoch_stats: Vec<EpochStats>,
     step: usize,
     epoch: usize,
@@ -95,9 +97,9 @@ impl BatchAccumulator {
 
 impl Trainer {
     /// Start a run from validated parts; `EMeans::begin` owns the validation.
-    pub(crate) fn new(d: usize, k: usize, recipe: Recipe, init: &[f32], seed: u64) -> Self {
+    pub(crate) fn new(d: usize, k: usize, recipe: Recipe, init: &[f32], seed: u64, capture_labels: bool) -> Self {
         debug!(
-            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={} seed={seed}",
+            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={} seed={seed} capture_labels={capture_labels}",
             recipe.batch_size, recipe.alpha0, recipe.epoch_rows, recipe.total_steps
         );
         let mut trainer = Trainer {
@@ -117,6 +119,7 @@ impl Trainer {
             pass_rows: 0,
             pass_splits: 0,
             pass_labels: None,
+            capture_labels,
             epoch_stats: Vec::with_capacity(recipe.epoch_rows.len()),
             step: 0,
             epoch: 0,
@@ -309,7 +312,14 @@ impl Trainer {
             self.epoch_stats.len(),
             self.step
         );
-        Ok(Model::new(centroids, self.epoch_stats, self.recipe, labels))
+        Ok(Model::new(
+            self.d,
+            self.kernel,
+            centroids,
+            self.epoch_stats,
+            self.recipe,
+            labels,
+        ))
     }
 
     fn passes(&self) -> usize {
@@ -511,7 +521,7 @@ impl Trainer {
         self.pass_objective = 0.0;
         self.pass_rows = 0;
         self.pass_splits = 0;
-        if self.is_last_pass() {
+        if self.is_last_pass() && self.capture_labels {
             self.pass_labels = Some(Vec::with_capacity(self.recipe.epoch_rows[self.epoch]));
         }
     }

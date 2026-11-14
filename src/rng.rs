@@ -18,13 +18,13 @@ const UNIFORM_SCALE: f64 = 1.0 / (1u64 << 53) as f64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamId {
     /// Row order of pass `i`: stream id `i`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "train draws pass orders from Phase 5"))]
     Pass(u64),
     /// Initial centroid rows: reserved id `u64::MAX`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "train draws init rows from Phase 5"))]
     Init,
     /// Revival donor choice: reserved id `u64::MAX - 1`.
     Revival,
+    /// Rows kept by `max_points_per_centroid`: reserved id `u64::MAX - 2`.
+    Subset,
 }
 
 impl StreamId {
@@ -33,6 +33,7 @@ impl StreamId {
             StreamId::Pass(pass) => pass,
             StreamId::Init => u64::MAX,
             StreamId::Revival => u64::MAX - 1,
+            StreamId::Subset => u64::MAX - 2,
         }
     }
 }
@@ -63,10 +64,6 @@ impl Stream {
     /// Uniform in `[0, bound)`, unbiased: Lemire's multiply-shift with rejection.
     ///
     /// Panics on `bound == 0`, which has no value to return.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Fisher-Yates is first called by train in Phase 5")
-    )]
     pub(crate) fn below(&mut self, bound: u64) -> u64 {
         assert!(bound > 0, "Stream::below needs a positive bound");
         let mut product = u128::from(self.next_u64()) * u128::from(bound);
@@ -80,7 +77,6 @@ impl Stream {
     }
 
     /// A uniformly random permutation of `0..n` (Durstenfeld's Fisher-Yates, from the top).
-    #[cfg_attr(not(test), expect(dead_code, reason = "train draws pass orders from Phase 5"))]
     pub(crate) fn permutation(&mut self, n: usize) -> Vec<usize> {
         let mut order: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
