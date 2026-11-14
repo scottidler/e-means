@@ -12,18 +12,18 @@ pub enum Error {
     InvalidParameter(String),
     #[error("non-finite input: {0}")]
     NonFiniteInput(String),
-    #[error("non-finite state: a split child overflowed")]
-    NonFiniteState,
+    #[error("non-finite state: {0}")]
+    NonFiniteState(String),
     #[error("trainer is poisoned by an earlier non-finite state")]
     Poisoned,
     #[error("batch incomplete: {have} of {want} rows")]
     BatchIncomplete { have: usize, want: usize },
     #[error("batch overflow: chunk of {chunk} rows exceeds the {remaining} remaining in the batch")]
     BatchOverflow { chunk: usize, remaining: usize },
-    #[error("epoch incomplete: {missing} rows missing")]
-    EpochIncomplete { missing: usize },
-    #[error("schedule complete: no steps remain")]
-    ScheduleComplete,
+    #[error("epoch incomplete: {0}")]
+    EpochIncomplete(String),
+    #[error("schedule complete: {0}")]
+    ScheduleComplete(String),
     #[error("invalid statistics: {0}")]
     InvalidStatistics(String),
 }
@@ -48,8 +48,15 @@ mod tests {
     }
 
     #[test]
-    fn unit_variants_render_fixed_messages() {
-        assert!(Error::ScheduleComplete.to_string().contains("no steps remain"));
-        assert!(Error::NonFiniteState.to_string().contains("overflowed"));
+    fn sequencing_variants_carry_their_reason() {
+        let e = Error::ScheduleComplete("all 3 passes have ended".to_string());
+        assert_eq!(e.to_string(), "schedule complete: all 3 passes have ended");
+        let e = Error::EpochIncomplete("pass 1 of 2 has 4 of 31 rows applied".to_string());
+        assert!(e.to_string().starts_with("epoch incomplete: pass 1"));
+        assert!(
+            Error::NonFiniteState("x".to_string())
+                .to_string()
+                .starts_with("non-finite state")
+        );
     }
 }

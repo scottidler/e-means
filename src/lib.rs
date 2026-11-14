@@ -4,7 +4,15 @@
 #![deny(dead_code)]
 #![deny(unused_variables)]
 
+mod assign;
+mod config;
 mod error;
+mod model;
 pub mod recipe;
+mod trainer;
 
+pub use config::EMeans;
 pub use error::{Error, Result};
+pub use model::{EpochStats, Model};
+pub use recipe::{BatchLaw, Recipe};
+pub use trainer::{BatchStats, Trainer};
