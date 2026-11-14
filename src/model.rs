@@ -3,7 +3,7 @@
 
 use log::debug;
 
-use crate::assign::{self, Kernel};
+use crate::assign::{self, Kernel, Metric};
 use crate::error::{Error, Result};
 use crate::recipe::Recipe;
 
@@ -11,7 +11,8 @@ use crate::recipe::Recipe;
 #[derive(Debug, Clone, PartialEq)]
 pub struct EpochStats {
     /// Sum over the pass's rows of the squared distance to the centroid each was assigned to, while the
-    /// centroids were still moving.
+    /// centroids were still moving. In spherical mode the per-row term is `2 - 2 * ip` against the unit-norm
+    /// readout.
     pub objective: f64,
     /// `k * sum(count_j^2) / rows^2`; 1 when every cluster received the same number of rows.
     pub imbalance_factor: f64,
@@ -26,7 +27,8 @@ pub struct EpochStats {
 pub struct Assignment {
     /// Index of the nearest centroid per row; ties go to the lowest index.
     pub labels: Vec<u32>,
-    /// Squared L2 distance from each row to its nearest centroid.
+    /// Squared L2 distance from each row to its nearest centroid; in spherical mode `2 - 2 * ip`, which is
+    /// the squared distance when the row has unit norm (deviation D10: the reference returns `ip`).
     pub distances: Vec<f32>,
 }
 
@@ -35,6 +37,7 @@ pub struct Assignment {
 pub struct Model {
     d: usize,
     kernel: Kernel,
+    metric: Metric,
     centroids: Vec<f32>,
     epoch_stats: Vec<EpochStats>,
     recipe: Recipe,
@@ -45,6 +48,7 @@ impl Model {
     pub(crate) fn new(
         d: usize,
         kernel: Kernel,
+        metric: Metric,
         centroids: Vec<f32>,
         epoch_stats: Vec<EpochStats>,
         recipe: Recipe,
@@ -53,6 +57,7 @@ impl Model {
         Model {
             d,
             kernel,
+            metric,
             centroids,
             epoch_stats,
             recipe,
@@ -86,7 +91,9 @@ impl Model {
         self.labels.as_deref()
     }
 
-    /// Nearest final centroid of each row of `rows` (row-major, `d` columns), with the same kernel as the run.
+    /// Nearest final centroid of each row of `rows` (row-major, `d` columns), with the same kernel and metric
+    /// as the run. In spherical mode the nearest centroid is the one with the largest inner product; rows are
+    /// not normalized here, that is the caller's job.
     ///
     /// `Error::DimensionMismatch` when `rows` is not whole rows; `Error::NonFiniteInput` on a NaN or
     /// infinite value, which would otherwise lose every comparison and land on centroid 0.
@@ -110,7 +117,20 @@ impl Model {
         let n = rows.len() / self.d;
         let mut labels = vec![0; n];
         let mut distances = vec![0.0; n];
-        assign::nearest(self.kernel, rows, &self.centroids, self.d, &mut labels, &mut distances);
+        assign::nearest(
+            self.kernel,
+            self.metric,
+            rows,
+            &self.centroids,
+            self.d,
+            &mut labels,
+            &mut distances,
+        );
+        if self.metric == Metric::InnerProduct {
+            for distance in &mut distances {
+                *distance = 2.0 - 2.0 * *distance;
+            }
+        }
         debug!("Model::assign: {n} rows assigned");
         Ok(Assignment { labels, distances })
     }

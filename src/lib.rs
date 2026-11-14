@@ -11,6 +11,7 @@ mod model;
 pub mod recipe;
 mod revival;
 mod rng;
+mod spherical;
 mod trainer;
 
 pub use config::EMeans;

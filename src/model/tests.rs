@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
-use crate::assign::Kernel;
+use crate::assign::{Kernel, Metric};
 use crate::recipe::{BatchLaw, RecipeSpec};
 
 fn recipe() -> Recipe {
@@ -33,6 +33,7 @@ fn accessors_return_what_the_trainer_handed_over() {
     let model = Model::new(
         1,
         Kernel::Direct,
+        Metric::L2,
         vec![1.0, 11.0],
         vec![stats()],
         recipe(),
@@ -46,7 +47,7 @@ fn accessors_return_what_the_trainer_handed_over() {
 
 #[test]
 fn labels_are_none_when_not_captured() {
-    let model = Model::new(1, Kernel::Direct, vec![1.0], vec![], recipe(), None);
+    let model = Model::new(1, Kernel::Direct, Metric::L2, vec![1.0], vec![], recipe(), None);
     assert_eq!(model.labels(), None);
 }
 
@@ -54,6 +55,7 @@ fn two_cluster_model() -> Model {
     Model::new(
         2,
         Kernel::Direct,
+        Metric::L2,
         vec![0.0, 0.0, 10.0, 10.0],
         vec![stats()],
         recipe(),
@@ -98,11 +100,32 @@ fn assign_rejects_partial_and_non_finite_rows() {
 #[test]
 fn scatter_labels_moves_feed_positions_to_rows() {
     let labels = vec![Some(1), Some(0)];
-    let mut model = Model::new(1, Kernel::Direct, vec![1.0], vec![], recipe(), Some(labels));
+    let mut model = Model::new(1, Kernel::Direct, Metric::L2, vec![1.0], vec![], recipe(), Some(labels));
     model.scatter_labels(&[3, 0, 2], 4);
     assert_eq!(model.labels().unwrap(), &[Some(0), None, None, Some(1)]);
 
-    let mut uncaptured = Model::new(1, Kernel::Direct, vec![1.0], vec![], recipe(), None);
+    let mut uncaptured = Model::new(1, Kernel::Direct, Metric::L2, vec![1.0], vec![], recipe(), None);
     uncaptured.scatter_labels(&[0], 1);
     assert_eq!(uncaptured.labels(), None);
+}
+
+// Deviation D10: in spherical mode `Assignment.distances` holds `2 - 2 * ip`, and the label is the largest ip.
+#[test]
+fn spherical_assign_returns_two_minus_two_ip() {
+    let model = Model::new(
+        2,
+        Kernel::Direct,
+        Metric::InnerProduct,
+        vec![1.0, 0.0, 0.0, 1.0],
+        vec![stats()],
+        recipe(),
+        None,
+    );
+    let assignment = model.assign(&[0.6, 0.8, -1.0, 0.0, 0.0, 0.0]).unwrap();
+    assert_eq!(
+        assignment.labels,
+        [1, 1, 0],
+        "zero beats negative; a zero row ties at 0 and takes index 0"
+    );
+    assert_eq!(assignment.distances, [2.0 - 2.0 * 0.8f32, 2.0, 2.0]);
 }

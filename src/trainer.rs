@@ -2,16 +2,18 @@
 //!
 //! `REF` is `contrib/e_means` in Faiss at `d1d9789a`. The EMA follows `REF/e_means.py:456-505`; the
 //! batch and pass accounting follows `REF/base.py:243-286` and `:439-457`; closing follows
-//! `REF/e_means.py:531-564`.
+//! `REF/e_means.py:531-564`. Spherical mode follows `REF/e_means.py:217-241`, `:303-307`, `:432-434` and
+//! `:512-529`.
 
 use log::{debug, trace};
 
-use crate::assign::{self, Kernel};
+use crate::assign::{self, Kernel, Metric};
 use crate::error::{Error, Result};
 use crate::model::{EpochStats, Model};
 use crate::recipe::{CHECK_UNUSED_EVERY, INIT_USAGE, Recipe, scheduled_alpha};
 use crate::revival;
 use crate::rng::{Stream, StreamId};
+use crate::spherical;
 
 /// Rows per assignment block, counted from the start of the logical batch.
 ///
@@ -26,7 +28,7 @@ pub struct BatchStats<'a> {
     pub sums: &'a [f64],
     /// Rows per cluster, `k`.
     pub counts: &'a [u64],
-    /// Sum of the rows' squared distances to their assigned centroid.
+    /// Sum of the rows' squared distances to their assigned centroid; in spherical mode, of `2 - 2 * ip`.
     pub objective: f64,
 }
 
@@ -47,17 +49,21 @@ pub struct Trainer {
     k: usize,
     recipe: Recipe,
     kernel: Kernel,
+    /// `Metric::InnerProduct` in spherical mode.
+    metric: Metric,
     /// EMA mass N_j per cluster.
     usage: Vec<f32>,
-    /// EMA centroid c_j, `k * d`.
+    /// EMA centroid c_j, `k * d`; un-normalized in spherical mode.
     centroids: Vec<f32>,
-    /// Centroids frozen at the first chunk of each batch; every row of the batch is assigned against it.
+    /// What every row of the current batch is assigned against. Euclidean: the centroids, frozen at the
+    /// first chunk of the batch. Spherical: their unit-norm readout, refreshed after each update.
     snapshot: Vec<f32>,
     batch: BatchAccumulator,
     /// Rows of a partial block, waiting for the next chunk.
     carry: Vec<f32>,
     block_labels: Vec<u32>,
-    block_distances: Vec<f32>,
+    /// Per-row score of the block's assignment: squared distance, or inner product in spherical mode.
+    block_scores: Vec<f32>,
     pass_counts: Vec<u64>,
     /// Closing-pass sums; accumulated only in the last pass.
     pass_sums: Vec<f64>,
@@ -97,22 +103,37 @@ impl BatchAccumulator {
 
 impl Trainer {
     /// Start a run from validated parts; `EMeans::begin` owns the validation.
-    pub(crate) fn new(d: usize, k: usize, recipe: Recipe, init: &[f32], seed: u64, capture_labels: bool) -> Self {
+    ///
+    /// Spherical mode (`Metric::InnerProduct`) normalizes the initial centroids (`REF/e_means.py:322-328`).
+    pub(crate) fn new(
+        d: usize,
+        k: usize,
+        recipe: Recipe,
+        init: &[f32],
+        seed: u64,
+        capture_labels: bool,
+        metric: Metric,
+    ) -> Self {
         debug!(
-            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={} seed={seed} capture_labels={capture_labels}",
+            "Trainer::new: d={d} k={k} batch={} alpha0={} passes={:?} total_steps={} seed={seed} capture_labels={capture_labels} metric={metric:?}",
             recipe.batch_size, recipe.alpha0, recipe.epoch_rows, recipe.total_steps
         );
+        let mut centroids = init.to_vec();
+        if metric == Metric::InnerProduct {
+            spherical::normalize_rows(&mut centroids, d);
+        }
         let mut trainer = Trainer {
             d,
             k,
             kernel: Kernel::Direct,
+            metric,
             usage: vec![INIT_USAGE; k],
-            centroids: init.to_vec(),
-            snapshot: init.to_vec(),
+            snapshot: centroids.clone(),
+            centroids,
             batch: BatchAccumulator::new(k, d),
             carry: Vec::with_capacity(BLOCK_ROWS.min(recipe.batch_size) * d),
             block_labels: Vec::new(),
-            block_distances: Vec::new(),
+            block_scores: Vec::new(),
             pass_counts: vec![0; k],
             pass_sums: vec![0.0; k * d],
             pass_objective: 0.0,
@@ -127,6 +148,7 @@ impl Trainer {
             split_rng: Stream::new(seed, StreamId::Revival),
             recipe,
         };
+        trainer.refresh_readout();
         trainer.start_pass();
         trainer
     }
@@ -177,7 +199,7 @@ impl Trainer {
         if chunk == 0 {
             return Ok(());
         }
-        if self.received() == 0 {
+        if self.received() == 0 && self.metric == Metric::L2 {
             self.snapshot.copy_from_slice(&self.centroids);
         }
         let mut rest = rows;
@@ -283,7 +305,9 @@ impl Trainer {
 
     /// Replace each centroid assigned in the last pass by the mean of its rows, and return the model.
     ///
-    /// Centroids with no rows in the last pass keep their EMA position (`REF/e_means.py:531-564`).
+    /// Centroids with no rows in the last pass keep their EMA position (`REF/e_means.py:531-564`). In
+    /// spherical mode every centroid is then projected to unit norm in f32, a zero one staying zero
+    /// (`REF/e_means.py:512-529`).
     pub fn finalize(self) -> Result<Model> {
         debug!("Trainer::finalize: epoch={} step={}", self.epoch, self.step);
         if self.poisoned {
@@ -306,6 +330,9 @@ impl Trainer {
                 *c = (s / count as f64) as f32;
             }
         }
+        if self.metric == Metric::InnerProduct {
+            spherical::normalize_rows(&mut centroids, self.d);
+        }
         let labels = self.pass_labels.map(|labels| labels.into_iter().map(Some).collect());
         debug!(
             "Trainer::finalize: {} passes, {} steps",
@@ -315,6 +342,7 @@ impl Trainer {
         Ok(Model::new(
             self.d,
             self.kernel,
+            self.metric,
             centroids,
             self.epoch_stats,
             self.recipe,
@@ -405,26 +433,34 @@ impl Trainer {
     fn assign_block(&mut self, block: &[f32]) {
         let rows = block.len() / self.d;
         self.block_labels.resize(rows, 0);
-        self.block_distances.resize(rows, 0.0);
+        self.block_scores.resize(rows, 0.0);
         assign::nearest(
             self.kernel,
+            self.metric,
             block,
             &self.snapshot,
             self.d,
             &mut self.block_labels,
-            &mut self.block_distances,
+            &mut self.block_scores,
         );
-        for ((row, &label), &distance) in block
+        if self.metric == Metric::InnerProduct {
+            // `2 - 2 * ip` per row, as `2 * rows` plus the f32 values `-2 * ip` (`REF/e_means.py:432-434`).
+            self.batch.objective += 2.0 * rows as f64;
+        }
+        for ((row, &label), &score) in block
             .chunks_exact(self.d)
             .zip(&self.block_labels)
-            .zip(&self.block_distances)
+            .zip(&self.block_scores)
         {
             let j = label as usize;
             self.batch.counts[j] += 1;
             for (s, &x) in self.batch.sums[j * self.d..(j + 1) * self.d].iter_mut().zip(row) {
                 *s += f64::from(x);
             }
-            self.batch.objective += f64::from(distance);
+            self.batch.objective += match self.metric {
+                Metric::L2 => f64::from(score),
+                Metric::InnerProduct => f64::from(-2.0 * score),
+            };
         }
         if let Some(labels) = self.pass_labels.as_mut() {
             labels.extend_from_slice(&self.block_labels);
@@ -494,10 +530,20 @@ impl Trainer {
                 }
             }
         }
+        self.refresh_readout();
         self.step += 1;
         self.pass_rows += due;
         self.batch.clear();
         Ok(())
+    }
+
+    /// Spherical mode: project the EMA state into the unit-norm readout the next batch is assigned against
+    /// (`REF/e_means.py:217-241`). The EMA state itself stays un-normalized. Euclidean mode freezes the
+    /// snapshot at the next batch's first chunk instead.
+    fn refresh_readout(&mut self) {
+        if self.metric == Metric::InnerProduct {
+            spherical::normalize_into(&self.centroids, &mut self.snapshot, self.d);
+        }
     }
 
     /// Split a heavy cluster into each dead one (`REF/e_means.py:261-300`).

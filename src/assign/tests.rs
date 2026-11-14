@@ -4,7 +4,15 @@ fn direct_nearest(rows: &[f32], centroids: &[f32], d: usize) -> (Vec<u32>, Vec<f
     let n = rows.len() / d;
     let mut labels = vec![u32::MAX; n];
     let mut distances = vec![f32::NAN; n];
-    nearest(Kernel::Direct, rows, centroids, d, &mut labels, &mut distances);
+    nearest(
+        Kernel::Direct,
+        Metric::L2,
+        rows,
+        centroids,
+        d,
+        &mut labels,
+        &mut distances,
+    );
     (labels, distances)
 }
 
@@ -44,5 +52,65 @@ fn empty_rows_assign_nothing() {
 fn mismatched_buffers_panic() {
     let mut labels = [0u32; 2];
     let mut distances = [0f32; 2];
-    nearest(Kernel::Direct, &[1.0, 2.0, 3.0], &[0.0], 1, &mut labels, &mut distances);
+    nearest(
+        Kernel::Direct,
+        Metric::L2,
+        &[1.0, 2.0, 3.0],
+        &[0.0],
+        1,
+        &mut labels,
+        &mut distances,
+    );
+}
+
+fn inner_product_nearest(rows: &[f32], centroids: &[f32], d: usize) -> (Vec<u32>, Vec<f32>) {
+    let n = rows.len() / d;
+    let mut labels = vec![u32::MAX; n];
+    let mut products = vec![f32::NAN; n];
+    nearest(
+        Kernel::Direct,
+        Metric::InnerProduct,
+        rows,
+        centroids,
+        d,
+        &mut labels,
+        &mut products,
+    );
+    (labels, products)
+}
+
+#[test]
+fn inner_product_picks_the_largest_product() {
+    let centroids = [1.0, 0.0, 0.0, 1.0, -1.0, 0.0];
+    let (labels, products) = inner_product_nearest(&[0.6, 0.8, -3.0, 1.0, 0.5, -0.25], &centroids, 2);
+    assert_eq!(labels, [1, 2, 0]);
+    assert_eq!(products, [0.8, 3.0, 0.5]);
+}
+
+// Edge-case table: a zero row has inner product 0 with every centroid; label is the lowest index among the
+// maxima. Faiss tests/e_means_test_utils.py:273-290 `test_spherical_zero_beats_negative_similarity`
+#[test]
+fn inner_product_zero_row_takes_the_lowest_index_and_zero_beats_negative() {
+    let (labels, products) = inner_product_nearest(&[0.0, 0.0], &[1.0, 0.0, 0.0, 1.0], 2);
+    assert_eq!(labels, [0]);
+    assert_eq!(products, [0.0]);
+    let (labels, products) = inner_product_nearest(&[-1.0, 0.0, 0.0, 0.0], &[0.0, 0.0, 1.0, 0.0], 2);
+    assert_eq!(labels, [0, 0], "tests/e_means_test_utils.py:289");
+    assert_eq!(products, [0.0, 0.0]);
+}
+
+#[test]
+#[should_panic(expected = "labels and scores disagree")]
+fn mismatched_score_buffer_panics() {
+    let mut labels = [0u32; 1];
+    let mut products = [0f32; 2];
+    nearest(
+        Kernel::Direct,
+        Metric::InnerProduct,
+        &[1.0],
+        &[0.0],
+        1,
+        &mut labels,
+        &mut products,
+    );
 }

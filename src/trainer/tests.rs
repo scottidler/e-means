@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::config::EMeans;
+use std::f32::consts::FRAC_1_SQRT_2;
 
 const TEST: &str = "tests/test_e_means.py";
 const UTILS: &str = "tests/e_means_test_utils.py";
@@ -88,7 +89,15 @@ fn closing_mean_four_point_fixture() {
     );
     let mut labels = [0u32; 4];
     let mut distances = [0f32; 4];
-    assign::nearest(Kernel::Direct, &x, model.centroids(), 1, &mut labels, &mut distances);
+    assign::nearest(
+        Kernel::Direct,
+        Metric::L2,
+        &x,
+        model.centroids(),
+        1,
+        &mut labels,
+        &mut distances,
+    );
     assert_eq!(labels, [0, 0, 1, 1], "{TEST}:315");
     assert_eq!(distances, [1.0, 1.0, 1.0, 1.0], "{TEST}:316");
     let stats = &model.epoch_stats()[0];
@@ -618,4 +627,212 @@ fn alpha_one_keeps_untouched_mass() {
     trainer.update().unwrap();
     assert_eq!(trainer.usage, vec![4.0, INIT_USAGE]);
     assert_eq!(trainer.centroids, vec![1.5, 100.0]);
+}
+
+fn assert_close(got: &[f32], want: &[f32], atol: f32, context: &str) {
+    assert_eq!(got.len(), want.len(), "{context}");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (g - w).abs() <= atol,
+            "{context}: value {i} is {g}, want {w} (atol {atol})"
+        );
+    }
+}
+
+// Design criterion: the reference spherical fixture gives objective 7.5 and labels [0, 1, 1, 2, 0, 0].
+// Faiss tests/e_means_test_utils.py:118-166 `test_spherical_ip_zero_objective_and_represented_statistics`
+#[test]
+fn spherical_ip_zero_objective_and_represented_statistics() {
+    let initial = [0.0, 0.0, 1.0, 0.0, -1.0, 0.0];
+    let rows = [
+        0.0,
+        0.0,
+        0.25,
+        15f32.sqrt() / 4.0,
+        1.0,
+        0.0,
+        -1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -1.0,
+    ];
+    let expected_labels = [0u32, 1, 1, 2, 0, 0];
+    let builder = EMeans::new(2, 3).epochs(1.0).batch_size(6).alpha0(1.0).spherical(true);
+    let mut trainer = builder.begin(6, &initial).unwrap();
+    for chunk in rows.chunks(2 * 2) {
+        trainer.accumulate(chunk).unwrap();
+    }
+    assert_eq!(trainer.pass_labels.as_deref().unwrap(), expected_labels, "{UTILS}:142");
+    assert_eq!(trainer.batch.counts, [3, 2, 1], "{UTILS}:148");
+    let mut sums = [0f64; 6];
+    for (row, &label) in rows.as_chunks::<2>().0.iter().zip(&expected_labels) {
+        let j = label as usize;
+        sums[2 * j] += f64::from(row[0]);
+        sums[2 * j + 1] += f64::from(row[1]);
+    }
+    assert_eq!(trainer.batch.sums, sums, "{UTILS}:149");
+    assert!(
+        (trainer.batch.objective - 7.5).abs() < 1e-6,
+        "{UTILS}:150: {}",
+        trainer.batch.objective
+    );
+    trainer.update().unwrap();
+    trainer.end_epoch().unwrap();
+    let model = trainer.finalize().unwrap();
+    let labels: Vec<u32> = model.labels().unwrap().iter().map(|l| l.unwrap()).collect();
+    assert_eq!(labels, expected_labels);
+    let fin = model.centroids();
+    assert_eq!(&fin[..2], &[0.0, 0.0], "{UTILS}:154 zero mean stays zero");
+
+    let assignment = model.assign(&rows).unwrap();
+    for (i, row) in rows.as_chunks::<2>().0.iter().enumerate() {
+        let scores: Vec<f32> = fin
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| row[0] * c[0] + row[1] * c[1])
+            .collect();
+        let best = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let argmax = scores.iter().position(|&s| s == best).unwrap() as u32;
+        assert_eq!(assignment.labels[i], argmax, "{UTILS}:157 row {i}");
+        let want = 2.0 - 2.0 * best;
+        assert!(
+            (assignment.distances[i] - want).abs() <= 4e-7,
+            "{UTILS}:160 (D10: 2 - 2 * ip) row {i}: {} vs {want}",
+            assignment.distances[i]
+        );
+    }
+    assert!((model.epoch_stats()[0].objective - 7.5).abs() < 1e-6, "{UTILS}:164");
+}
+
+// Faiss tests/e_means_test_utils.py:273-290 `test_spherical_zero_beats_negative_similarity`
+#[test]
+fn spherical_zero_beats_negative_similarity() {
+    let builder = EMeans::new(2, 2).epochs(1.0).batch_size(2).alpha0(1.0).spherical(true);
+    let mut trainer = builder.begin(2, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+    trainer.accumulate(&[-1.0, 0.0, 0.0, 0.0]).unwrap();
+    assert_eq!(trainer.pass_labels.as_deref().unwrap(), [0, 0], "{UTILS}:289");
+    assert_eq!(trainer.batch.objective, 4.0, "{UTILS}:290");
+}
+
+/// The spherical fixture of `UTILS:168-226`: d = 2, k = 1, two batches of 3 rows, alpha0 0.25.
+fn deferred_ema_trainer() -> Trainer {
+    EMeans::new(2, 1)
+        .epochs(1.0)
+        .batch_size(3)
+        .alpha0(0.25)
+        .spherical(true)
+        .begin(6, &[3.0, 4.0])
+        .unwrap()
+}
+
+// Faiss tests/e_means_test_utils.py:168-226 `test_spherical_deferred_ema_borrowed_cache_and_chunks`.
+// The bite check for the readout refresh: skipping it leaves the readout at the initial direction.
+#[test]
+fn spherical_deferred_ema_keeps_raw_state_and_refreshes_readout() {
+    let rows = [1.0, 0.0, 0.0, 1.0, -1.0, 0.0];
+    let mut model = deferred_ema_trainer();
+    let mut control = deferred_ema_trainer();
+    assert_close(
+        &model.centroids,
+        &[0.6, 0.8],
+        1e-7,
+        "begin normalizes the initial centroids",
+    );
+    let raw = model.centroids.clone();
+    let usage = model.usage[0];
+    let before = model.snapshot.clone();
+    model.accumulate(&rows[..2]).unwrap();
+    assert_eq!(model.snapshot, before, "{UTILS}:190 readout frozen inside the batch");
+    model.accumulate(&rows[2..]).unwrap();
+    assert_eq!(model.snapshot, before, "{UTILS}:198");
+    assert!(
+        (model.batch.objective - 4.4).abs() < 5e-6,
+        "{UTILS}:199: {}",
+        model.batch.objective
+    );
+
+    let mass = 0.75f32 * usage + 0.25 * 3.0;
+    let weight = 0.25f32 * 3.0 / mass;
+    let mean = [0.0f32, 1.0 / 3.0];
+    let expected: Vec<f32> = raw.iter().zip(mean).map(|(&c, m)| c + weight * (m - c)).collect();
+    model.update().unwrap();
+    control.accumulate(&rows).unwrap();
+    control.update().unwrap();
+    assert_close(
+        &model.centroids,
+        &expected,
+        1e-7,
+        "tests/e_means_test_utils.py:206 raw EMA state",
+    );
+    let norm = expected.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(
+        model.centroids.iter().map(|v| v * v).sum::<f32>().sqrt() < 0.999,
+        "{UTILS}:209 EMA state stays un-normalized"
+    );
+    let unit: Vec<f32> = expected.iter().map(|v| v / norm).collect();
+    assert_close(
+        &model.snapshot,
+        &unit,
+        1e-7,
+        "tests/e_means_test_utils.py:212 readout refreshed after the update",
+    );
+
+    for trainer in [&mut model, &mut control] {
+        trainer.accumulate(&rows).unwrap();
+        trainer.update().unwrap();
+        trainer.end_epoch().unwrap();
+    }
+    let (model, control) = (model.finalize().unwrap(), control.finalize().unwrap());
+    assert_eq!(bits(model.centroids()), bits(control.centroids()), "{UTILS}:221");
+    assert_eq!(objectives(&model), objectives(&control), "{UTILS}:224");
+}
+
+// Faiss tests/e_means_test_utils.py:292-325 `test_spherical_torch_version_and_inference_invalidation`, the
+// half that is not about Torch version counters: the readout follows the update.
+#[test]
+fn spherical_readout_follows_the_update() {
+    let builder = EMeans::new(2, 1).epochs(1.0).batch_size(2).alpha0(1.0).spherical(true);
+    let mut trainer = builder.begin(2, &[1.0, 0.0]).unwrap();
+    assert_eq!(trainer.snapshot, [1.0, 0.0]);
+    trainer.accumulate(&[0.0, -1.0, 0.0, -1.0]).unwrap();
+    trainer.update().unwrap();
+    assert_eq!(trainer.snapshot, [0.0, -1.0], "{UTILS}:319");
+}
+
+// Faiss tests/e_means_test_utils.py:260-271 (`test_spherical_projection_extremes_and_wide_closing`, closing
+// half), through the same direct seam: pass statistics set by hand. Closing takes the mean in f64, rounds it to
+// f32, then projects in f32 with the max-abs prescale; a cluster with no rows keeps its EMA position, normalized.
+#[test]
+fn spherical_closing_projects_means_and_empty_clusters() {
+    let rows = [1.0, 0.0, 0.0, 1.0, -1.0, 0.0];
+    let builder = EMeans::new(2, 3).epochs(1.0).batch_size(3).alpha0(1.0).spherical(true);
+    let mut trainer = builder.begin(3, &rows).unwrap();
+    trainer.accumulate(&rows).unwrap();
+    trainer.update().unwrap();
+    trainer.end_epoch().unwrap();
+    trainer.pass_sums = vec![6e38, -6e38, 0.0, 0.0, 0.0, 0.0];
+    trainer.pass_counts = vec![2, 1, 0];
+    trainer.centroids[4..].copy_from_slice(&[-3.0, 0.0]);
+    let model = trainer.finalize().unwrap();
+    assert_close(
+        model.centroids(),
+        &[FRAC_1_SQRT_2, -FRAC_1_SQRT_2, 0.0, 0.0, -1.0, 0.0],
+        1e-7,
+        "tests/e_means_test_utils.py:266",
+    );
+}
+
+// Euclidean mode is untouched by the spherical machinery: the snapshot is the raw centroids, no projection.
+#[test]
+fn euclidean_mode_does_not_normalize() {
+    let builder = EMeans::new(2, 1).epochs(1.0).batch_size(2).alpha0(1.0);
+    let mut trainer = builder.begin(2, &[3.0, 4.0]).unwrap();
+    assert_eq!(trainer.centroids, [3.0, 4.0]);
+    trainer.accumulate(&[0.0, 2.0, 0.0, 2.0]).unwrap();
+    trainer.update().unwrap();
+    trainer.end_epoch().unwrap();
+    assert_eq!(trainer.finalize().unwrap().centroids(), &[0.0, 2.0]);
 }

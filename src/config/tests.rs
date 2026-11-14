@@ -443,3 +443,96 @@ fn train_errors_are_typed() {
         Err(Error::InvalidParameter(ref m)) if m.contains("epochs")
     ));
 }
+
+fn unit_rows(mut x: Vec<f32>, d: usize) -> Vec<f32> {
+    for row in x.chunks_exact_mut(d) {
+        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        row.iter_mut().for_each(|v| *v /= norm);
+    }
+    x
+}
+
+/// Rows whose norm is not within 1e-6 of 1 and not exactly zero.
+fn off_sphere(centroids: &[f32], d: usize) -> Vec<(usize, f32)> {
+    centroids
+        .chunks_exact(d)
+        .map(|c| c.iter().map(|v| v * v).sum::<f32>().sqrt())
+        .enumerate()
+        .filter(|&(_, norm)| norm != 0.0 && (norm - 1.0).abs() > 1e-6)
+        .collect()
+}
+
+// Design criterion: every final centroid has norm within 1e-6 of 1, or is exactly zero.
+#[test]
+fn spherical_final_centroids_are_unit_or_zero() {
+    let x = unit_rows(blobs(2000, 8, 16, 10.0), 8);
+    let model = EMeans::new(8, 16).spherical(true).seed(3).train(&x).unwrap();
+    assert_eq!(off_sphere(model.centroids(), 8), [], "blobs on the sphere");
+    assert_eq!(model.recipe().unused_threshold, 0.1, "revival is live at d = 8");
+
+    // The UTILS:118 fixture through `train_from`: centroid 0 only receives rows that sum to zero.
+    let rows = [
+        0.0,
+        0.0,
+        0.25,
+        15f32.sqrt() / 4.0,
+        1.0,
+        0.0,
+        -1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -1.0,
+    ];
+    let model = EMeans::new(2, 3)
+        .epochs(1.0)
+        .batch_size(6)
+        .alpha0(1.0)
+        .spherical(true)
+        .train_from(&rows, &[0.0, 0.0, 1.0, 0.0, -1.0, 0.0])
+        .unwrap();
+    assert_eq!(off_sphere(model.centroids(), 2), []);
+    assert_eq!(
+        &model.centroids()[..2],
+        &[0.0, 0.0],
+        "the exactly-zero branch is exercised"
+    );
+}
+
+// Faiss tests/e_means_test_utils.py:327-388 `test_spherical_fractional_caller_and_matrix`. The reference
+// compares at atol 2e-7; with the crate's own pass orders (D1) the caller loop is bitwise equal.
+#[test]
+fn spherical_fractional_caller_and_matrix() {
+    let d = 5;
+    let rows = unit_rows(values(31 * d, 73, 1.0), d);
+    let init = rows[..4 * d].to_vec();
+    for budget in [0.5, 1.5] {
+        let builder = EMeans::new(d, 4)
+            .epochs(budget)
+            .spherical(true)
+            .batch_size(7)
+            .alpha0(0.2)
+            .seed(7);
+        let matrix = builder.train_from(&rows, &init).unwrap();
+        let (caller, order) = caller_run(&builder, &rows, d, &init, 7);
+        assert_eq!(
+            bits(matrix.centroids()),
+            bits(caller.centroids()),
+            "{UTILS}:377 T={budget}"
+        );
+        assert_eq!(
+            matrix.labels().unwrap(),
+            &row_order(&caller, &order, 31)[..],
+            "{UTILS}:382 T={budget}"
+        );
+        assert_eq!(objectives(&matrix), objectives(&caller), "{UTILS}:385 T={budget}");
+        assert_eq!(off_sphere(matrix.centroids(), d), [], "T={budget}");
+    }
+}
+
+#[test]
+fn spherical_defaults_off() {
+    assert!(!EMeans::new(2, 2).spherical);
+    assert!(EMeans::new(2, 2).spherical(true).spherical);
+}

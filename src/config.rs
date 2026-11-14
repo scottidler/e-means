@@ -5,6 +5,7 @@
 
 use log::debug;
 
+use crate::assign::Metric;
 use crate::error::{Error, Result};
 use crate::model::Model;
 use crate::recipe::{BatchLaw, Recipe, RecipeSpec};
@@ -27,6 +28,7 @@ pub struct EMeans {
     seed: u64,
     max_points_per_centroid: Option<usize>,
     capture_labels: bool,
+    spherical: bool,
 }
 
 impl EMeans {
@@ -43,6 +45,7 @@ impl EMeans {
             seed: DEFAULT_SEED,
             max_points_per_centroid: None,
             capture_labels: true,
+            spherical: false,
         }
     }
 
@@ -95,6 +98,13 @@ impl EMeans {
         self
     }
 
+    /// Spherical k-means (default false): assignment by largest inner product against unit-norm centroids,
+    /// unit-norm final centroids. Rows are neither normalized nor checked; that is the caller's job.
+    pub fn spherical(mut self, spherical: bool) -> Self {
+        self.spherical = spherical;
+        self
+    }
+
     /// Train on `x` (row-major, `d` columns) from seeded initial centroids.
     ///
     /// Init is the first k rows of a seeded permutation, or the rows as given when n == k
@@ -121,8 +131,16 @@ impl EMeans {
     /// Every error is found before a trainer exists.
     pub fn begin(&self, n: usize, init: &[f32]) -> Result<Trainer> {
         debug!(
-            "EMeans::begin: n={n} d={} k={} epochs={} batch_law={:?} batch_size={:?} alpha0={:?} unused_threshold={:?} seed={}",
-            self.d, self.k, self.epochs, self.batch_law, self.batch_size, self.alpha0, self.unused_threshold, self.seed
+            "EMeans::begin: n={n} d={} k={} epochs={} batch_law={:?} batch_size={:?} alpha0={:?} unused_threshold={:?} seed={} spherical={}",
+            self.d,
+            self.k,
+            self.epochs,
+            self.batch_law,
+            self.batch_size,
+            self.alpha0,
+            self.unused_threshold,
+            self.seed,
+            self.spherical
         );
         self.validate_shape()?;
         if n < self.k {
@@ -160,6 +178,7 @@ impl EMeans {
             init,
             self.seed,
             self.capture_labels,
+            if self.spherical { Metric::InnerProduct } else { Metric::L2 },
         ))
     }
 
