@@ -150,6 +150,23 @@ tasks:
       echo "mutants: cargo-mutants exit code $rc written to $(pwd)/rc"
       exit "$rc"
 
+  # Faiss reference venv for the fixture generator (NOT part of ci)
+  compat-setup:
+    help: "Create compat/.venv with the pinned Faiss reference (NOT part of ci)"
+    bash: |
+      uv venv --clear compat/.venv
+      uv pip install --python compat/.venv/bin/python -r compat/requirements.txt
+
+  # Regenerate tests/fixtures/ from the Faiss reference (NOT part of ci)
+  compat:
+    help: "Regenerate tests/fixtures/ from faiss-cpu NumpyEmeans; run compat-setup first (NOT part of ci)"
+    bash: |
+      if [ ! -x compat/.venv/bin/python ]; then
+        echo "compat: compat/.venv is missing; run 'otto compat-setup' first" >&2
+        exit 1
+      fi
+      compat/.venv/bin/python -I compat/generate.py
+
   # Full CI pipeline
   ci:
     help: "Full CI pipeline (lint + check + test in parallel)"

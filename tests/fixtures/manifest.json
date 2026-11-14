@@ -1,0 +1,492 @@
+{
+  "faiss": "1.16.0",
+  "numpy": "2.5.4",
+  "emeans_seed": 1234,
+  "fixtures": [
+    {
+      "name": "separated_d8",
+      "class": "separated",
+      "n": 4000,
+      "d": 8,
+      "k": 16,
+      "epochs": 5.0,
+      "spherical": false,
+      "unused_threshold": 0.0,
+      "batch_law": "quality",
+      "batch_size": 32,
+      "alpha0": 0.10500128138887335,
+      "epoch_rows": [
+        4000,
+        4000,
+        4000,
+        4000,
+        4000
+      ],
+      "total_steps": 625,
+      "objectives": [
+        400319.44181519747,
+        230719.24699687958,
+        229155.26279222965,
+        228534.19879576564,
+        227625.09230928123
+      ],
+      "splits": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "draw": "faiss",
+      "init": {
+        "file": "separated_d8.init.bin",
+        "dtype": "f32"
+      },
+      "orders": {
+        "file": "separated_d8.orders.bin",
+        "dtype": "u32"
+      },
+      "x": {
+        "file": "blobs_d8.x.bin",
+        "dtype": "f32"
+      },
+      "x_fnv1a": "ae80c74bb443173f",
+      "init_fnv1a": "2d9ae2af0b41f881",
+      "orders_fnv1a": "75a8bdf6ec9693c9",
+      "centroids": {
+        "file": "separated_d8.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "separated_d8.labels.bin",
+        "dtype": "u32"
+      },
+      "faiss_blas_forced": {
+        "centroid": 0.0,
+        "objective": 7.919611277508364e-08,
+        "labels": 1.0
+      }
+    },
+    {
+      "name": "separated_d32",
+      "class": "separated",
+      "n": 4000,
+      "d": 32,
+      "k": 16,
+      "epochs": 5.0,
+      "spherical": false,
+      "unused_threshold": 0.0,
+      "batch_law": "throughput",
+      "batch_size": 256,
+      "alpha0": 0.6827261133215953,
+      "epoch_rows": [
+        4000,
+        4000,
+        4000,
+        4000,
+        4000
+      ],
+      "total_steps": 80,
+      "objectives": [
+        2245088.777223587,
+        2015983.3741925359,
+        1997272.4152862313,
+        1992425.645901698,
+        1990763.1010694504
+      ],
+      "splits": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "draw": "faiss",
+      "init": {
+        "file": "separated_d32.init.bin",
+        "dtype": "f32"
+      },
+      "orders": {
+        "file": "separated_d32.orders.bin",
+        "dtype": "u32"
+      },
+      "x": {
+        "file": "blobs_d32.x.bin",
+        "dtype": "f32"
+      },
+      "x_fnv1a": "fda57ecb225d571e",
+      "init_fnv1a": "c59e6bd6fc9e1a3e",
+      "orders_fnv1a": "75a8bdf6ec9693c9",
+      "centroids": {
+        "file": "separated_d32.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "separated_d32.labels.bin",
+        "dtype": "u32"
+      },
+      "faiss_blas_forced": {
+        "centroid": 0.0,
+        "objective": 5.254743238144262e-08,
+        "labels": 1.0
+      }
+    },
+    {
+      "name": "separated_d8_t2_5",
+      "class": "separated",
+      "n": 4000,
+      "d": 8,
+      "k": 16,
+      "epochs": 2.5,
+      "spherical": false,
+      "unused_threshold": 0.0,
+      "batch_law": "quality",
+      "batch_size": 16,
+      "alpha0": 0.060533552864801804,
+      "epoch_rows": [
+        4000,
+        2000,
+        4000
+      ],
+      "total_steps": 625,
+      "objectives": [
+        269570.91414898634,
+        114444.42160001397,
+        228467.1173467338
+      ],
+      "splits": [
+        0,
+        0,
+        0
+      ],
+      "draw": "faiss",
+      "init": {
+        "file": "separated_d8_t2_5.init.bin",
+        "dtype": "f32"
+      },
+      "orders": {
+        "file": "separated_d8_t2_5.orders.bin",
+        "dtype": "u32"
+      },
+      "x": {
+        "file": "blobs_d8.x.bin",
+        "dtype": "f32"
+      },
+      "x_fnv1a": "ae80c74bb443173f",
+      "init_fnv1a": "2d9ae2af0b41f881",
+      "orders_fnv1a": "e9f8f852a8a06862",
+      "centroids": {
+        "file": "separated_d8_t2_5.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "separated_d8_t2_5.labels.bin",
+        "dtype": "u32"
+      },
+      "faiss_blas_forced": {
+        "centroid": 0.0,
+        "objective": 2.4815928345403958e-08,
+        "labels": 1.0
+      }
+    },
+    {
+      "name": "separated_spherical_d32",
+      "class": "separated",
+      "n": 4000,
+      "d": 32,
+      "k": 16,
+      "epochs": 5.0,
+      "spherical": true,
+      "unused_threshold": 0.0,
+      "batch_law": "throughput",
+      "batch_size": 256,
+      "alpha0": 0.6827261133215953,
+      "epoch_rows": [
+        4000,
+        4000,
+        4000,
+        4000,
+        4000
+      ],
+      "total_steps": 80,
+      "objectives": [
+        772.1246659755707,
+        699.9522579908371,
+        694.618218421936,
+        691.9036540985107,
+        691.0708209276199
+      ],
+      "splits": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "draw": "faiss",
+      "init": {
+        "file": "separated_spherical_d32.init.bin",
+        "dtype": "f32"
+      },
+      "orders": {
+        "file": "separated_spherical_d32.orders.bin",
+        "dtype": "u32"
+      },
+      "x": {
+        "file": "blobs_d32_unit.x.bin",
+        "dtype": "f32"
+      },
+      "x_fnv1a": "0bc0ba21c80d55aa",
+      "init_fnv1a": "482639c664ef3599",
+      "orders_fnv1a": "75a8bdf6ec9693c9",
+      "centroids": {
+        "file": "separated_spherical_d32.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "separated_spherical_d32.labels.bin",
+        "dtype": "u32"
+      },
+      "faiss_blas_forced": {
+        "centroid": 0.0,
+        "objective": 7.417473427402126e-09,
+        "labels": 1.0
+      }
+    },
+    {
+      "name": "separated_d2",
+      "class": "separated",
+      "n": 4000,
+      "d": 2,
+      "k": 16,
+      "epochs": 5.0,
+      "spherical": false,
+      "unused_threshold": 0.0,
+      "batch_law": "quality",
+      "batch_size": 32,
+      "alpha0": 0.10500128138887335,
+      "epoch_rows": [
+        4000,
+        4000,
+        4000,
+        4000,
+        4000
+      ],
+      "total_steps": 625,
+      "objectives": [
+        8603.14276114013,
+        8172.7121011118,
+        7656.206390862906,
+        7461.480586243619,
+        7420.0961190492235
+      ],
+      "splits": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "draw": "faiss",
+      "init": {
+        "file": "separated_d2.init.bin",
+        "dtype": "f32"
+      },
+      "orders": {
+        "file": "separated_d2.orders.bin",
+        "dtype": "u32"
+      },
+      "x": {
+        "file": "blobs_d2.x.bin",
+        "dtype": "f32"
+      },
+      "x_fnv1a": "e19f0d9b92b83a9d",
+      "init_fnv1a": "8f34a47075af20b9",
+      "orders_fnv1a": "75a8bdf6ec9693c9",
+      "centroids": {
+        "file": "separated_d2.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "separated_d2.labels.bin",
+        "dtype": "u32"
+      },
+      "faiss_blas_forced": {
+        "centroid": 0.0,
+        "objective": 5.569949337516993e-08,
+        "labels": 1.0
+      }
+    },
+    {
+      "name": "oversplit",
+      "class": "loose",
+      "n": 4000,
+      "d": 32,
+      "k": 64,
+      "epochs": 5.0,
+      "spherical": false,
+      "unused_threshold": 0.0,
+      "batch_law": "throughput",
+      "batch_size": 256,
+      "alpha0": 0.35997754958149286,
+      "epoch_rows": [
+        4000,
+        4000,
+        4000,
+        4000,
+        4000
+      ],
+      "total_steps": 80,
+      "objectives": [
+        133144.1370830536,
+        126528.5979600624,
+        125288.32149295782,
+        123807.25151169626,
+        122454.23982091933
+      ],
+      "splits": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "draw": "faiss",
+      "init": {
+        "file": "oversplit.init.bin",
+        "dtype": "f32"
+      },
+      "orders": {
+        "file": "oversplit.orders.bin",
+        "dtype": "u32"
+      },
+      "x": {
+        "file": "blobs_d32.x.bin",
+        "dtype": "f32"
+      },
+      "x_fnv1a": "fda57ecb225d571e",
+      "init_fnv1a": "30f2c76c6d2d3da2",
+      "orders_fnv1a": "75a8bdf6ec9693c9",
+      "centroids": {
+        "file": "oversplit.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "oversplit.labels.bin",
+        "dtype": "u32"
+      }
+    },
+    {
+      "name": "large",
+      "class": "loose",
+      "n": 100000,
+      "d": 32,
+      "k": 256,
+      "epochs": 5.0,
+      "spherical": false,
+      "unused_threshold": 0.0,
+      "batch_law": "throughput",
+      "batch_size": 8192,
+      "alpha0": 1.0,
+      "epoch_rows": [
+        100000,
+        100000,
+        100000,
+        100000,
+        100000
+      ],
+      "total_steps": 65,
+      "objectives": [
+        7259204.170758247,
+        6191329.754812241,
+        6143601.43672657,
+        6113604.425164331,
+        6095657.330136299
+      ],
+      "splits": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "draw": "splitmix",
+      "stream_seed": 32000,
+      "x": {
+        "generator": "grid_blobs",
+        "n": 100000,
+        "d": 32,
+        "blobs": 256,
+        "center_scale": 3,
+        "seed": 32
+      },
+      "x_fnv1a": "c0f1f751b785caee",
+      "init_fnv1a": "5c7595c29c0864f6",
+      "orders_fnv1a": "52cb059d2931f55d",
+      "centroids": {
+        "file": "large.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "large.labels.bin",
+        "dtype": "u32"
+      }
+    },
+    {
+      "name": "large_revival",
+      "class": "loose",
+      "n": 100000,
+      "d": 32,
+      "k": 256,
+      "epochs": 5.0,
+      "spherical": false,
+      "unused_threshold": 0.1,
+      "batch_law": "throughput",
+      "batch_size": 8192,
+      "alpha0": 1.0,
+      "epoch_rows": [
+        100000,
+        100000,
+        100000,
+        100000,
+        100000
+      ],
+      "total_steps": 65,
+      "objectives": [
+        6887804.815940857,
+        5192709.2260427475,
+        5113934.792034149,
+        5083002.855523109,
+        5064512.466234207
+      ],
+      "splits": [
+        34,
+        10,
+        2,
+        0,
+        0
+      ],
+      "draw": "splitmix",
+      "stream_seed": 32000,
+      "x": {
+        "generator": "grid_blobs",
+        "n": 100000,
+        "d": 32,
+        "blobs": 256,
+        "center_scale": 3,
+        "seed": 32
+      },
+      "x_fnv1a": "c0f1f751b785caee",
+      "init_fnv1a": "5c7595c29c0864f6",
+      "orders_fnv1a": "52cb059d2931f55d",
+      "centroids": {
+        "file": "large_revival.centroids.bin",
+        "dtype": "f32"
+      },
+      "labels": {
+        "file": "large_revival.labels.bin",
+        "dtype": "u32"
+      }
+    }
+  ]
+}

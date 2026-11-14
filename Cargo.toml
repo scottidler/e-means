@@ -11,3 +11,12 @@ log = "0.4.35"
 rand_chacha = "0.10.0"
 rand_core = "0.10.1"
 thiserror = "2.0.21"
+
+[dev-dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+
+# Parity and quality tests train on 100000 rows; unoptimized they take minutes. No fast-math in Rust,
+# so optimizing does not change a single result bit.
+[profile.test]
+opt-level = 3
