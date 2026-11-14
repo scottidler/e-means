@@ -64,7 +64,7 @@ pub(crate) fn centroid_norms(kernel: Kernel, metric: Metric, centroids: &[f32], 
 /// is the squared distance under `Metric::L2` and the inner product under `Metric::InnerProduct`. `norms`
 /// is `centroid_norms(kernel, metric, centroids, d)`, hoisted so a call computes it once, not per block.
 /// `scratch` is the calling task's buffer, reused across calls; it holds at most `max(TILE_FLOATS, rows)` f32
-/// whatever k is.
+/// under `Kernel::Gemm` and `max(TILE_FLOATS, LANES * d)` under `Kernel::Direct`, whatever k is.
 #[allow(clippy::too_many_arguments)] // the design's signature: inputs, outputs and the task's scratch
 pub(crate) fn nearest(
     kernel: Kernel,
@@ -123,8 +123,35 @@ fn nearest_capped(
         assert_eq!(norms.len(), centroids.len() / d, "norms are not one per centroid");
     }
     match (kernel, metric) {
-        (Kernel::Direct, Metric::L2) => direct_l2(rows, centroids, d, labels, scores),
-        (Kernel::Direct, Metric::InnerProduct) => direct_inner_product(rows, centroids, d, labels, scores),
+        (Kernel::Direct, Metric::L2) => direct_lanes(
+            rows,
+            centroids,
+            d,
+            labels,
+            scores,
+            scratch,
+            tile_floats,
+            f32::INFINITY,
+            |sum, x, c| {
+                let diff = x - c;
+                sum + diff * diff
+            },
+            squared_l2,
+            |v, best| v < best,
+        ),
+        (Kernel::Direct, Metric::InnerProduct) => direct_lanes(
+            rows,
+            centroids,
+            d,
+            labels,
+            scores,
+            scratch,
+            tile_floats,
+            f32::NEG_INFINITY,
+            |sum, x, c| sum + x * c,
+            inner_product,
+            |v, best| v > best,
+        ),
         (Kernel::Gemm, metric) => gemm_nearest(metric, rows, centroids, norms, d, labels, scores, scratch, tile_floats),
     }
 }
@@ -295,37 +322,132 @@ fn disjoint(a: &[f32], b: &[f32]) -> bool {
     a.is_empty() || b.is_empty() || a.end <= b.start || b.end <= a.start
 }
 
-fn direct_l2(rows: &[f32], centroids: &[f32], d: usize, labels: &mut [u32], distances: &mut [f32]) {
-    for ((row, label), distance) in rows.chunks_exact(d).zip(labels.iter_mut()).zip(distances.iter_mut()) {
-        let mut best = 0usize;
-        let mut best_distance = f32::INFINITY;
-        for (j, centroid) in centroids.chunks_exact(d).enumerate() {
-            let squared = squared_l2(row, centroid);
-            if squared < best_distance {
-                best = j;
-                best_distance = squared;
+/// The Direct kernel over one block: each row's score against every centroid by today's scalar fold, 16
+/// centroids at a time.
+///
+/// The centroids in full groups of `LANES` are tiled, `width = LANES * max(1, tile_floats / (LANES * d))`
+/// centroids per tile, at most the full groups' count. Each tile is transposed into `scratch` so coordinate
+/// `c` of centroid `j0 + g * LANES + l` sits at `g * LANES * d + c * LANES + l`; lane `l` of a group then folds
+/// `fold(acc, x[c], centroid[c])` from 0.0, coordinate 0 first: the exact ops of `squared_l2` or
+/// `inner_product` against that one centroid. A row's lanes keep their best under the strict order and merge
+/// as `lane_scan` merges them, so a tile yields the first index at its best score; tiles run in ascending
+/// order and a later tile wins only on the strict order. The `k mod LANES` centroids past the last full
+/// group go through `scalar` after every tile, ids above every tile's. Together: the first index at the
+/// row's best score, as one sequential strict scan finds.
+///
+/// `scratch` grows to at most `max(tile_floats, LANES * d)` f32 whatever k is.
+#[allow(clippy::too_many_arguments)]
+fn direct_lanes(
+    rows: &[f32],
+    centroids: &[f32],
+    d: usize,
+    labels: &mut [u32],
+    scores: &mut [f32],
+    scratch: &mut Vec<f32>,
+    tile_floats: usize,
+    worst: f32,
+    fold: impl Fn(f32, f32, f32) -> f32 + Copy,
+    scalar: impl Fn(&[f32], &[f32]) -> f32,
+    better: impl Fn(f32, f32) -> bool + Copy,
+) {
+    if labels.is_empty() {
+        return;
+    }
+    let k = centroids.len() / d;
+    let grouped = k - k % LANES;
+    labels.fill(0);
+    scores.fill(worst);
+    if grouped > 0 {
+        let width = (LANES * (tile_floats / (LANES * d)).max(1)).min(grouped);
+        let layout_floats = width * d;
+        if scratch.len() < layout_floats {
+            scratch.reserve_exact(layout_floats - scratch.len());
+            scratch.resize(layout_floats, 0.0);
+        }
+        for j0 in (0..grouped).step_by(width) {
+            let j1 = (j0 + width).min(grouped);
+            let layout = &mut scratch[..(j1 - j0) * d];
+            transpose_into_lanes(&centroids[j0 * d..j1 * d], d, layout);
+            for ((row, label), score) in rows.chunks_exact(d).zip(labels.iter_mut()).zip(scores.iter_mut()) {
+                let (id, best) = lane_groups_best(row, layout, d, worst, fold, better);
+                if better(best, *score) {
+                    *label = j0 as u32 + id;
+                    *score = best;
+                }
             }
         }
-        *label = best as u32;
-        *distance = best_distance;
+    }
+    for ((row, label), score) in rows.chunks_exact(d).zip(labels.iter_mut()).zip(scores.iter_mut()) {
+        for (offset, centroid) in centroids[grouped * d..].chunks_exact(d).enumerate() {
+            let v = scalar(row, centroid);
+            if better(v, *score) {
+                *label = (grouped + offset) as u32;
+                *score = v;
+            }
+        }
     }
 }
 
-/// Largest inner product; a zero row ties every centroid at 0 and takes index 0.
-fn direct_inner_product(rows: &[f32], centroids: &[f32], d: usize, labels: &mut [u32], products: &mut [f32]) {
-    for ((row, label), product) in rows.chunks_exact(d).zip(labels.iter_mut()).zip(products.iter_mut()) {
-        let mut best = 0usize;
-        let mut best_product = f32::NEG_INFINITY;
-        for (j, centroid) in centroids.chunks_exact(d).enumerate() {
-            let ip = inner_product(row, centroid);
-            if ip > best_product {
-                best = j;
-                best_product = ip;
+/// Rewrite `centroids` (whole groups of `LANES`, row-major with `d` columns) into lane layout: coordinate `c`
+/// of centroid `g * LANES + l` goes to `layout[g * LANES * d + c * LANES + l]`.
+fn transpose_into_lanes(centroids: &[f32], d: usize, layout: &mut [f32]) {
+    assert_eq!(centroids.len(), layout.len(), "layout is not the tile's size");
+    assert!(
+        centroids.len().is_multiple_of(LANES * d),
+        "centroids are not whole groups of LANES"
+    );
+    for (group, lanes) in centroids
+        .chunks_exact(LANES * d)
+        .zip(layout.chunks_exact_mut(LANES * d))
+    {
+        for (l, centroid) in group.chunks_exact(d).enumerate() {
+            for (c, &value) in centroid.iter().enumerate() {
+                lanes[c * LANES + l] = value;
             }
         }
-        *label = best as u32;
-        *product = best_product;
     }
+}
+
+/// One row against every group of a lane-layout tile: the first tile-local index at the best score, and
+/// that score. Lane `l` keeps its lowest id at its best with the strict order; lanes merge in lane order, an
+/// equal score going to the lower id, never at `worst` (so a row of all `worst` takes id 0, as a sequential
+/// scan does).
+fn lane_groups_best(
+    row: &[f32],
+    layout: &[f32],
+    d: usize,
+    worst: f32,
+    fold: impl Fn(f32, f32, f32) -> f32,
+    better: impl Fn(f32, f32) -> bool,
+) -> (u32, f32) {
+    let mut lane_best = [worst; LANES];
+    let mut lane_id = [0u32; LANES];
+    let mut base = 0u32;
+    for group in layout.chunks_exact(LANES * d) {
+        let (coordinates, _) = group.as_chunks::<LANES>();
+        let mut acc = [0.0f32; LANES];
+        for (&x, lane) in row.iter().zip(coordinates) {
+            for l in 0..LANES {
+                acc[l] = fold(acc[l], x, lane[l]);
+            }
+        }
+        for l in 0..LANES {
+            if better(acc[l], lane_best[l]) {
+                lane_best[l] = acc[l];
+                lane_id[l] = base + l as u32;
+            }
+        }
+        base += LANES as u32;
+    }
+    let (mut best, mut best_id) = (worst, 0u32);
+    for l in 0..LANES {
+        let v = lane_best[l];
+        if better(v, best) || (v == best && v != worst && lane_id[l] < best_id) {
+            best = v;
+            best_id = lane_id[l];
+        }
+    }
+    (best_id, best)
 }
 
 fn inner_product(row: &[f32], centroid: &[f32]) -> f32 {

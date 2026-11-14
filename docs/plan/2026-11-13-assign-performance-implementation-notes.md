@@ -140,3 +140,31 @@
 - Mutations, run once and restored, each failing both oracle tests: (a) an owner adding into a zero-started partial merged at the end: `sums, L2 d=3 rows=805 owners=2`; re-run with every random starting sum zeroed so only the cancellation clusters' 0.5 starts remain: `sums[0] (cluster 0) got 1.5 want 1`. (b) an owner walking the blocks in reverse: `sums, L2 d=3 rows=805 owners=2` and `sums, L2 rows=8485 threads=8`.
 - Bench, `3564435` re-measured interleaved with this phase, two rounds (load 13.9-25.7): d=32 27.971, 27.643 -> 24.799, 24.806 ms; d=8 84.168, 88.278 -> 82.543, 87.108 ms. Threshold probe at `1 << 13`: d=8 199.39, 196.89 ms (2.1x worse), so d=8 must stay serial. Full table in the design doc, Phase 5.
 - `otto ci` exit 0, `All CI checks passed!`; 143 lib tests, 11 parity (determinism and golden digests ok), 4 quality, 1 doctest. `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`.
+
+## Phase 6: Lane-vectorized Direct
+
+### Design decisions
+- `direct_lanes` (`src/assign.rs`) replaces `direct_l2` and `direct_inner_product`: one generic kernel taking the metric's identity (`+inf` / `-inf`), its lane fold (`sum + diff * diff` with `diff = x - c`; `sum + x * c`), its scalar fold for the tail (`squared_l2` / `inner_product`, today's functions) and its strict order (`<` / `>`). Monomorphized per metric in `nearest_capped`'s match.
+- Tiles cover only the `k - k % LANES` centroids in full groups, width `LANES * max(1, tile_floats / (LANES * d))` clamped to that count, so every tile is whole groups. The `k mod LANES` tail runs after the last tile through the scalar fold with the strict order, ids above every tile's, as the doc's pseudocode orders it.
+- Loop order is tile outer, rows inner: each tile is transposed once per call (`transpose_into_lanes`) and every row of the block scans it. Each row's running best lives in its `labels` / `scores` slots; a tile replaces it only on the strict order.
+- `lane_groups_best` mirrors `lane_scan`'s merge: per-lane best under the strict order (lane keeps its lowest id), lanes merged in lane order with `v == best && v != worst && id < best_id`. The inner loop is `acc: [f32; LANES]` over `as_chunks::<LANES>()` coordinates, so lane `l` runs exactly `squared_l2(row, centroid)`'s ops from 0.0, coordinate 0 first. No FMA, no `mul_add`, no `target_feature`, no new `unsafe`.
+- Scratch grows by `reserve_exact` only when shorter than the layout, so its capacity never exceeds `max(earlier capacity, tile layout)`; never shrunk, so a task's later blocks reuse it without refilling. The Direct path now uses the `for_each_init` scratch the earlier phases plumbed through.
+- Tests: `lane_direct_equals_the_oracle_bitwise_on_random_and_quantized_data` (d in {1, 2, 3, 8, 16, 33} x k in {1, 15, 16, 17, 33, 256}, random and quantized-to-0.5 data, both metrics, fresh and reused dirty scratch), `tiled_lane_direct_equals_the_oracle_bitwise_with_five_or_more_tiles` (k in {80, 100, 256}, tiles of 1-3 groups leaving 5+ tiles, cap 0 included), `tiled_lane_direct_tie_straddling_a_tile_boundary_goes_to_the_lower_as_in_the_oracle` (k=100: ties across 16- and 32-wide tile boundaries, tile-vs-tail and tail-vs-tail), `tiled_lane_direct_all_infinite_and_nan_rows_match_the_oracle`, `direct_scratch_stays_under_the_tile_cap_at_d64_k65536_and_matches_the_oracle` (also d = TILE_FLOATS / LANES + 1: capacity exactly `LANES * d`), and two `transpose_into_lanes` tests (placement, partial-group panic).
+
+### Deviations
+- Doc pseudocode signature `direct_lanes(rows, scratch, j0)` became `direct_lanes(rows, centroids, d, labels, scores, scratch, tile_floats, worst, fold, scalar, better)` owning the tile loop, with `lane_groups_best(row, layout, ..)` as the per-row scan of one tile. Same effect, correct seam: one function for both metrics, the tile cap a parameter as in Phase 3.
+- `nearest`'s doc comment now states the Direct scratch bound `max(TILE_FLOATS, LANES * d)` beside the Gemm one.
+
+### Tradeoffs
+- One generic kernel with closures vs two hand-written metric copies: one copy of the tile, lane and merge logic; the closures are `Copy` and monomorphized, and the bench shows the inner loop vectorizes (d=8 train 82.5-87.1 -> 42.9 ms).
+- Reusing `lane_scan`'s merge rule by a sibling function instead of calling `lane_scan` on a materialized row of k scores: materializing would need a `rows x k` buffer or a per-row k-wide one, which is the unbounded scratch change 2 removed.
+- Grow-only scratch vs `resize` to the exact tile every call: no zero-fill per block; the bound still holds because the Direct layout size is fixed per call.
+
+### Open questions
+- `train-d8-default-1t` sits exactly on its 1.6 bound (1.603 and 1.600 in two rounds); it is gated at Phase 9 and Phase 7 may move it either way. Worth watching, not acted on here.
+
+#### Recorded observations
+- `bin/h2h`, Phase 5 (`3468734`) vs Phase 6 interleaved, two rounds, load 2.27-2.55: train d=8 1t 4.235/4.227 -> 1.603/1.600; 8t 5.935/4.533 -> 1.969/2.185 (Phase 7 gate); 64t 2.087/2.133 -> 0.988/1.011; assign d=8 1t 4.643/4.679 -> 1.736/1.737; 64t 4.192/4.024 -> 1.662/1.578. Full table in the design doc, Phase 6.
+- `cargo bench --bench train -- n100000_d8`: 42.880 ms [42.206, 44.317] (Phase 5: 82.543, 87.108 ms).
+- Mutations, run once and restored: cross-tile merge on equal (`|| best == *score`) fails the three `tiled_lane_direct_*` tests; a lane keeping the later id on equal fails `tie_between_two_centroids_in_one_lane_goes_to_the_lower` and three more.
+- `otto ci` exit 0; 150 lib tests, 11 parity (determinism and golden digests ok), 4 quality, 1 doctest. `cargo test oracle`: 11 passed. `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`.

@@ -857,3 +857,213 @@ fn gemm_element_is_independent_of_tile_and_split() {
         }
     }
 }
+
+/// Values from `lcg_values` rounded to multiples of 0.5 in `[-1, 1)`: four distinct coordinates, so many
+/// rows sit at exactly equal distance from several centroids.
+fn quantized_values(len: usize, seed: u64) -> Vec<f32> {
+    lcg_values(len, seed).iter().map(|v| (v * 2.0).floor() / 2.0).collect()
+}
+
+#[test]
+fn lane_direct_equals_the_oracle_bitwise_on_random_and_quantized_data() {
+    let n = 40;
+    let mut scratch = vec![f32::NAN; 5];
+    for d in [1, 2, 3, 8, 16, 33] {
+        for k in [1, 15, 16, 17, 33, 256] {
+            let seed = (d * 1000 + k) as u64;
+            let data = [
+                ("random", lcg_values(n * d, seed), lcg_values(k * d, seed + 7)),
+                (
+                    "quantized",
+                    quantized_values(n * d, seed),
+                    quantized_values(k * d, seed + 7),
+                ),
+            ];
+            for (what, rows, centroids) in &data {
+                for metric in METRICS {
+                    let oracle = oracle_nearest(Kernel::Direct, metric, rows, centroids, d);
+                    assert_eq!(
+                        production_nearest(Kernel::Direct, metric, rows, centroids, d),
+                        oracle,
+                        "{what} d={d} k={k} {metric:?}"
+                    );
+                    assert_eq!(
+                        tiled_nearest(Kernel::Direct, metric, rows, centroids, d, TILE_FLOATS, &mut scratch),
+                        oracle,
+                        "{what} d={d} k={k} {metric:?}, reused scratch"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tiled_lane_direct_equals_the_oracle_bitwise_with_five_or_more_tiles() {
+    // One dirty scratch for every call: a tile must not depend on what an earlier call left in it.
+    let mut scratch = vec![f32::NAN; 3];
+    for d in [1, 2, 3, 8, 16, 33] {
+        for k in [80, 100, 256] {
+            let seed = (d * 9000 + k) as u64;
+            let data = [
+                ("random", lcg_values(37 * d, seed), lcg_values(k * d, seed + 1)),
+                (
+                    "quantized",
+                    quantized_values(37 * d, seed),
+                    quantized_values(k * d, seed + 1),
+                ),
+            ];
+            let groups = k / LANES;
+            // Tile widths of 1, 2 and 3 groups that leave 5 or more tiles; a cap of 0 still takes one group.
+            for (what, rows, centroids) in &data {
+                for tile_groups in [1, 2, 3].into_iter().filter(|&g| groups.div_ceil(g) >= 5) {
+                    for tile_floats in [tile_groups * LANES * d, (tile_groups + 1) * LANES * d - 1, 0] {
+                        for metric in METRICS {
+                            assert_eq!(
+                                tiled_nearest(Kernel::Direct, metric, rows, centroids, d, tile_floats, &mut scratch),
+                                oracle_nearest(Kernel::Direct, metric, rows, centroids, d),
+                                "{what} d={d} k={k} cap={tile_floats} {metric:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tiled_lane_direct_tie_straddling_a_tile_boundary_goes_to_the_lower_as_in_the_oracle() {
+    // k = 100, d = 2, cap 2 * LANES * 2 at most: tiles of 16 or 32 centroids over [0, 96), tail 96..100.
+    for (tied, want) in [
+        (&[15, 16][..], 15),
+        (&[16, 15][..], 15),
+        (&[31, 32, 99][..], 31),
+        (&[63, 64, 65][..], 63),
+        (&[80, 96][..], 80),
+        (&[97, 95][..], 95),
+        (&[98, 97][..], 97),
+    ] {
+        let (row, centroids) = tie_fixture(100, tied);
+        for metric in METRICS {
+            let oracle = oracle_nearest(Kernel::Direct, metric, &row, &centroids, 2);
+            assert_eq!(oracle.0, [want], "{tied:?} {metric:?}: oracle");
+            for tile_floats in [0, LANES * 2, 2 * LANES * 2, TILE_FLOATS] {
+                assert_eq!(
+                    tiled_nearest(
+                        Kernel::Direct,
+                        metric,
+                        &row,
+                        &centroids,
+                        2,
+                        tile_floats,
+                        &mut Vec::new()
+                    ),
+                    oracle,
+                    "{tied:?} {metric:?} cap={tile_floats}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tiled_lane_direct_all_infinite_and_nan_rows_match_the_oracle() {
+    let k = 53;
+    let mut scratch = Vec::new();
+    for tile_floats in [0, LANES, TILE_FLOATS] {
+        let near = vec![0.0f32; k];
+        let far = vec![-1e30f32; k];
+        for (metric, centroids) in [(Metric::L2, &near), (Metric::InnerProduct, &far)] {
+            for rows in [[1e30f32], [f32::NAN]] {
+                assert_eq!(
+                    tiled_nearest(Kernel::Direct, metric, &rows, centroids, 1, tile_floats, &mut scratch),
+                    oracle_nearest(Kernel::Direct, metric, &rows, centroids, 1),
+                    "{metric:?} rows={rows:?} cap={tile_floats}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_scratch_stays_under_the_tile_cap_at_d64_k65536_and_matches_the_oracle() {
+    let (d, k, n) = (64, 65536, 2);
+    let rows = lcg_values(n * d, 11);
+    let centroids = lcg_values(k * d, 12);
+    let bound = TILE_FLOATS.max(LANES * d);
+    for metric in METRICS {
+        let mut scratch = Vec::new();
+        let (mut labels, mut scores) = (vec![u32::MAX; n], vec![f32::NAN; n]);
+        nearest(
+            Kernel::Direct,
+            metric,
+            &rows,
+            &centroids,
+            &[],
+            d,
+            &mut labels,
+            &mut scores,
+            &mut scratch,
+        );
+        assert!(
+            scratch.capacity() <= bound,
+            "{metric:?}: scratch holds {} f32, bound {bound}",
+            scratch.capacity()
+        );
+        let (want_labels, want_scores) = oracle_nearest(Kernel::Direct, metric, &rows, &centroids, d);
+        assert_eq!(labels, want_labels, "{metric:?}");
+        assert_eq!(
+            scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            want_scores,
+            "{metric:?}"
+        );
+    }
+    // d past TILE_FLOATS / LANES: one group per tile, `LANES * d` f32.
+    let d = TILE_FLOATS / LANES + 1;
+    let centroids = lcg_values(2 * LANES * d, 13);
+    let rows = lcg_values(d, 14);
+    let mut scratch = Vec::new();
+    let (mut labels, mut scores) = ([0u32], [0.0f32]);
+    nearest(
+        Kernel::Direct,
+        Metric::L2,
+        &rows,
+        &centroids,
+        &[],
+        d,
+        &mut labels,
+        &mut scores,
+        &mut scratch,
+    );
+    assert_eq!(scratch.capacity(), LANES * d);
+    assert_eq!(
+        (labels.to_vec(), vec![scores[0].to_bits()]),
+        oracle_nearest(Kernel::Direct, Metric::L2, &rows, &centroids, d)
+    );
+}
+
+#[test]
+fn transpose_into_lanes_puts_coordinate_c_of_lane_l_at_c_times_lanes_plus_l() {
+    let d = 3;
+    let centroids: Vec<f32> = (0..2 * LANES * d).map(|v| v as f32).collect();
+    let mut layout = vec![f32::NAN; centroids.len()];
+    transpose_into_lanes(&centroids, d, &mut layout);
+    for g in 0..2 {
+        for l in 0..LANES {
+            for c in 0..d {
+                assert_eq!(
+                    layout[g * LANES * d + c * LANES + l],
+                    centroids[(g * LANES + l) * d + c]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "not whole groups of LANES")]
+fn transpose_into_lanes_rejects_a_partial_group() {
+    let mut layout = vec![0.0f32; 2 * (LANES - 1)];
+    transpose_into_lanes(&[0.0f32; 2 * (LANES - 1)], 2, &mut layout);
+}
