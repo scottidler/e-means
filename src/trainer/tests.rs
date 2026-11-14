@@ -98,6 +98,7 @@ fn closing_mean_four_point_fixture() {
         1,
         &mut labels,
         &mut distances,
+        &mut Vec::new(),
     );
     assert_eq!(labels, [0, 0, 1, 1], "{TEST}:315");
     assert_eq!(distances, [1.0, 1.0, 1.0, 1.0], "{TEST}:316");

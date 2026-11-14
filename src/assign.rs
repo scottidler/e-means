@@ -44,6 +44,11 @@ pub(crate) enum Metric {
 /// vectorizes on the baseline target.
 const LANES: usize = 16;
 
+/// Cap on a task's assignment scratch, in f32: 1 MB whatever k is. The Gemm kernel tiles the centroids so
+/// a `rows x tile width` block of inner products fits under it. 2^18 against 2^16 at k=65536, 64 threads:
+/// 0.624 vs 0.630 s train (median of 7), 155 vs 101 MB peak; the faster at 64 threads wins.
+pub(crate) const TILE_FLOATS: usize = 1 << 18;
+
 /// The centroid squared norms `nearest` takes: `||c||^2` per centroid under `Kernel::Gemm` and `Metric::L2`,
 /// empty otherwise. Compute it once per top-level call and share it across that call's tasks.
 pub(crate) fn centroid_norms(kernel: Kernel, metric: Metric, centroids: &[f32], d: usize) -> Vec<f32> {
@@ -58,7 +63,9 @@ pub(crate) fn centroid_norms(kernel: Kernel, metric: Metric, centroids: &[f32], 
 /// `rows` is `labels.len()` rows of `d` coordinates; `centroids` is row-major with `d` columns. The score
 /// is the squared distance under `Metric::L2` and the inner product under `Metric::InnerProduct`. `norms`
 /// is `centroid_norms(kernel, metric, centroids, d)`, hoisted so a call computes it once, not per block.
-#[allow(clippy::too_many_arguments)] // the design's signature; the per-task scratch joins it in Phase 3
+/// `scratch` is the calling task's buffer, reused across calls; it holds at most `max(TILE_FLOATS, rows)` f32
+/// whatever k is.
+#[allow(clippy::too_many_arguments)] // the design's signature: inputs, outputs and the task's scratch
 pub(crate) fn nearest(
     kernel: Kernel,
     metric: Metric,
@@ -68,6 +75,35 @@ pub(crate) fn nearest(
     d: usize,
     labels: &mut [u32],
     scores: &mut [f32],
+    scratch: &mut Vec<f32>,
+) {
+    nearest_capped(
+        kernel,
+        metric,
+        rows,
+        centroids,
+        norms,
+        d,
+        labels,
+        scores,
+        scratch,
+        TILE_FLOATS,
+    );
+}
+
+/// `nearest` with the scratch cap as a parameter, so tests can force many small tiles.
+#[allow(clippy::too_many_arguments)]
+fn nearest_capped(
+    kernel: Kernel,
+    metric: Metric,
+    rows: &[f32],
+    centroids: &[f32],
+    norms: &[f32],
+    d: usize,
+    labels: &mut [u32],
+    scores: &mut [f32],
+    scratch: &mut Vec<f32>,
+    tile_floats: usize,
 ) {
     assert_eq!(
         rows.len(),
@@ -89,13 +125,20 @@ pub(crate) fn nearest(
     match (kernel, metric) {
         (Kernel::Direct, Metric::L2) => direct_l2(rows, centroids, d, labels, scores),
         (Kernel::Direct, Metric::InnerProduct) => direct_inner_product(rows, centroids, d, labels, scores),
-        (Kernel::Gemm, metric) => gemm_nearest(metric, rows, centroids, norms, d, labels, scores),
+        (Kernel::Gemm, metric) => gemm_nearest(metric, rows, centroids, norms, d, labels, scores, scratch, tile_floats),
     }
 }
 
-/// The Gemm kernel over one block: a `rows x k` tile of inner products (the kernel's only scratch), then
-/// a lane scan per row. Under `Metric::L2` the score is `||x||^2 + ||c||^2 - 2 x.c`, clamped at 0, in Faiss's
-/// order (`exhaustive_L2sqr_blas`); under `Metric::InnerProduct` it is the inner product.
+/// The Gemm kernel over one block, tiled over the centroids: each tile of `width = (tile_floats / rows)`
+/// centroids (at least 1, at most k) gets a `rows x width` block of inner products in `scratch`, then a lane
+/// scan per row, merged into the row's running best.
+///
+/// Under `Metric::L2` the score is `||x||^2 + ||c||^2 - 2 x.c`, clamped at 0, in Faiss's order
+/// (`exhaustive_L2sqr_blas`); under `Metric::InnerProduct` it is the inner product. Each sgemm element
+/// depends only on its row, its centroid and d (matrixmultiply 0.3.11, pinned), never on the tile, so every
+/// score equals the untiled one. Tiles run in ascending centroid order and a later tile wins only on the
+/// strict order: the first index at the row's best score, as one scan over all k finds.
+#[allow(clippy::too_many_arguments)]
 fn gemm_nearest(
     metric: Metric,
     rows: &[f32],
@@ -104,34 +147,60 @@ fn gemm_nearest(
     d: usize,
     labels: &mut [u32],
     scores: &mut [f32],
+    scratch: &mut Vec<f32>,
+    tile_floats: usize,
 ) {
-    if labels.is_empty() {
+    let m = labels.len();
+    if m == 0 {
         return;
     }
     let k = centroids.len() / d;
-    let mut tile = vec![0.0f32; labels.len() * k];
-    inner_products(rows, centroids, d, &mut tile);
-    let per_row = rows
-        .chunks_exact(d)
-        .zip(tile.chunks_exact_mut(k))
-        .zip(labels.iter_mut().zip(scores.iter_mut()));
-    match metric {
-        Metric::L2 => {
-            for ((row, products), (label, distance)) in per_row {
-                let row_norm = inner_product(row, row);
-                for (product, &centroid_norm) in products.iter_mut().zip(norms) {
-                    let mut expanded = row_norm + centroid_norm - 2.0 * *product;
-                    if expanded < 0.0 {
-                        expanded = 0.0;
+    let width = (tile_floats / m).clamp(1, k);
+    let worst = match metric {
+        Metric::L2 => f32::INFINITY,
+        Metric::InnerProduct => f32::NEG_INFINITY,
+    };
+    labels.fill(0);
+    scores.fill(worst);
+    let row_norms: Vec<f32> = match metric {
+        Metric::L2 => rows.chunks_exact(d).map(|row| inner_product(row, row)).collect(),
+        Metric::InnerProduct => Vec::new(),
+    };
+    scratch.resize(m * width, 0.0);
+    for j0 in (0..k).step_by(width) {
+        let j1 = (j0 + width).min(k);
+        let tile_width = j1 - j0;
+        let tile = &mut scratch[..m * tile_width];
+        inner_products(rows, &centroids[j0 * d..j1 * d], d, tile);
+        let per_row = tile
+            .chunks_exact_mut(tile_width)
+            .zip(labels.iter_mut().zip(scores.iter_mut()));
+        match metric {
+            Metric::L2 => {
+                for (i, (products, (label, distance))) in per_row.enumerate() {
+                    let row_norm = row_norms[i];
+                    for (product, &centroid_norm) in products.iter_mut().zip(&norms[j0..j1]) {
+                        let mut expanded = row_norm + centroid_norm - 2.0 * *product;
+                        if expanded < 0.0 {
+                            expanded = 0.0;
+                        }
+                        *product = expanded;
                     }
-                    *product = expanded;
+                    let (id, best) = lane_scan(products, worst, |v, best| v < best);
+                    if best < *distance {
+                        *label = j0 as u32 + id;
+                        *distance = best;
+                    }
                 }
-                (*label, *distance) = lane_scan(products, f32::INFINITY, |v, best| v < best);
             }
-        }
-        Metric::InnerProduct => {
-            for ((_, products), (label, product)) in per_row {
-                (*label, *product) = lane_scan(products, f32::NEG_INFINITY, |v, best| v > best);
+            Metric::InnerProduct => {
+                for (products, (label, product)) in per_row {
+                    let (id, best) = lane_scan(products, worst, |v, best| v > best);
+                    if best > *product {
+                        *label = j0 as u32 + id;
+                        *product = best;
+                    }
+                }
             }
         }
     }

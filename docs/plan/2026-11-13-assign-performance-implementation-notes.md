@@ -55,3 +55,30 @@
 #### Recorded observations
 - Mutation, run once and restored: lane-merge tiebreak `lane_id[l] < best_id` changed to `>` fails `tie_between_two_lanes_goes_to_the_lower`, `a_row_equal_to_every_centroid_takes_index_zero_with_a_positive_zero_score` and `lane_scan_equals_a_sequential_scan_bitwise_on_tie_heavy_data`.
 - `cargo test --test parity`: 11 passed, `determinism_across_thread_counts_and_chunkings` ok (the Direct golden digests included). `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`. No `target_feature`, no `mul_add`.
+
+## Phase 3: Centroid tiling under TILE_FLOATS
+
+### Design decisions
+- `TILE_FLOATS = 1 << 18` in `src/assign.rs` (1 MB of f32 per task): the faster cap at 64 threads in the re-measure (median 0.624 vs 0.630 s train, 7 interleaved pairs; numbers in the design doc, Phase 3).
+- `nearest` gains `scratch: &mut Vec<f32>` (the doc's signature) and forwards to the private `nearest_capped(.., tile_floats)`; tests call `nearest_capped` to force small tiles, production passes `TILE_FLOATS`.
+- `gemm_nearest` tiles over centroids with `width = (tile_floats / rows).clamp(1, k)`, the last tile shorter. Each tile runs `inner_products` on `centroids[j0*d..j1*d]` into `scratch[..rows*width]`, pass 1 in place with `norms[j0..j1]`, then `lane_scan`; the tile's best replaces the row's running best only on the strict order (`<` L2, `>` IP). Labels start at 0 and scores at the identity, so an all-`inf` or NaN row keeps label 0 and the identity, as the oracle does.
+- Row norms are computed once per call into a `rows`-long `Vec`, not per tile, so a large k does not repeat them per tile.
+- `Trainer::assign_blocks` and `Model::assign` switch `for_each` to `for_each_init(Vec::new, ..)`: one scratch per rayon leaf job, no `thread_local!`. Direct ignores the scratch until Phase 6.
+- `Cargo.toml`: `matrixmultiply = "=0.3.11"`.
+- New tests in `src/assign/tests.rs`: `tiled_gemm_equals_the_oracle_bitwise_with_five_or_more_tiles` (d in {1, 3, 8, 17, 32}, k in {17, 33, 100, 256}, n in {1, 7, 60}, widths giving 5+ tiles, caps at and just under a width boundary, cap 0, one dirty scratch reused across every call), `tiled_tie_straddling_a_tile_boundary_goes_to_the_lower_as_in_the_oracle` (k=40 at width 8: ties at 7/8, 15/16, 31/32, 23/24/25), `tiled_all_infinite_and_nan_rows_match_the_oracle`, `gemm_scratch_stays_under_the_tile_cap_whatever_k_is`, `gemm_element_is_independent_of_tile_and_split` (the doc's grid, d in {1, 8, 32, 300}, k in {17, 256}, widths {1, 15, 16, 17}, splits {1, 7, 64} over 71 rows so every split has a short chunk). The first three carry `oracle` in their names, so `cargo test oracle` runs them (5 tests now).
+
+### Deviations
+- The tiled-oracle test's widths are the doc's {1, 15, 16, 17} plus {2, 3, k/5}, filtered to those leaving 5+ tiles: at k=17 only widths 1-3 give 5 tiles, so {15, 16, 17} alone cannot meet the "5+ tiles" criterion there. The S1 unit test keeps the doc's exact grid (tile count is not its point).
+- Row norms live in a per-call `Vec` beside `scratch`, not inside it: same effect, one small allocation (`rows` f32) per Gemm L2 block call, matching the per-job allocation count the doc already accepts.
+
+### Tradeoffs
+- 2^18 vs 2^16: 2^18 is about 1% faster at 64 threads (the doc's deciding cell) but uses about 54 MB more peak RSS at k=65536 (155 vs 101 MB) and is about 11% slower at 1 thread (9.0 vs 8.0 s). The doc's rule picks 64 threads; recorded as an open question.
+- Running best written straight into `labels`/`scores` vs a separate best buffer: no extra memory; the outputs are fully overwritten at the start of each call.
+
+### Open questions
+- Confirm 2^18 over 2^16: the 64-thread gain (6 ms median, 5 of 7 pairs) is near noise, while 2^16 is about 11% faster at 1 thread and 35% lighter at 64 threads. I followed the doc's rule ("keep the faster at 64 threads").
+
+#### Recorded observations
+- Mutation, run once and restored: the cross-tile merge `best < *distance` changed to `<=` fails `tiled_tie_straddling_a_tile_boundary_goes_to_the_lower_as_in_the_oracle` and `tiled_all_infinite_and_nan_rows_match_the_oracle`.
+- `otto ci` exit 0; 138 lib tests, 11 parity, 4 quality, 1 doctest. `cargo test --release --test parity`: 11 passed, determinism and golden digests ok. `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`; no `target_feature`, `mul_add` or `thread_local`.
+- Large-k gate (2^18), 64 threads: `train` 0.669, 0.630, 0.621 s; peak 154548, 154752, 157096 KB; digest `440bf89bb2f83d80`.

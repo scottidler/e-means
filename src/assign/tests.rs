@@ -13,6 +13,7 @@ fn direct_nearest(rows: &[f32], centroids: &[f32], d: usize) -> (Vec<u32>, Vec<f
         d,
         &mut labels,
         &mut distances,
+        &mut Vec::new(),
     );
     (labels, distances)
 }
@@ -70,6 +71,7 @@ fn mismatched_buffers_panic() {
         1,
         &mut labels,
         &mut distances,
+        &mut Vec::new(),
     );
 }
 
@@ -86,6 +88,7 @@ fn inner_product_nearest(rows: &[f32], centroids: &[f32], d: usize) -> (Vec<u32>
         d,
         &mut labels,
         &mut products,
+        &mut Vec::new(),
     );
     (labels, products)
 }
@@ -124,6 +127,7 @@ fn mismatched_score_buffer_panics() {
         1,
         &mut labels,
         &mut products,
+        &mut Vec::new(),
     );
 }
 
@@ -141,6 +145,7 @@ fn gemm_nearest_of(metric: Metric, rows: &[f32], centroids: &[f32], d: usize) ->
         d,
         &mut labels,
         &mut scores,
+        &mut Vec::new(),
     );
     (labels, scores)
 }
@@ -420,7 +425,17 @@ fn production_nearest(
     let mut labels = vec![u32::MAX; n];
     let mut scores = vec![f32::NAN; n];
     let norms = centroid_norms(kernel, metric, centroids, d);
-    nearest(kernel, metric, rows, centroids, &norms, d, &mut labels, &mut scores);
+    nearest(
+        kernel,
+        metric,
+        rows,
+        centroids,
+        &norms,
+        d,
+        &mut labels,
+        &mut scores,
+        &mut Vec::new(),
+    );
     (labels, scores.iter().map(|s| s.to_bits()).collect())
 }
 
@@ -651,5 +666,194 @@ fn gemm_l2_rejects_missing_norms() {
         2,
         &mut labels,
         &mut scores,
+        &mut Vec::new(),
     );
+}
+
+/// `nearest_capped` with a forced tile cap and a caller's (possibly dirty) scratch, labels and `to_bits`.
+fn tiled_nearest(
+    kernel: Kernel,
+    metric: Metric,
+    rows: &[f32],
+    centroids: &[f32],
+    d: usize,
+    tile_floats: usize,
+    scratch: &mut Vec<f32>,
+) -> (Vec<u32>, Vec<u32>) {
+    let n = rows.len() / d;
+    let mut labels = vec![u32::MAX; n];
+    let mut scores = vec![f32::NAN; n];
+    let norms = centroid_norms(kernel, metric, centroids, d);
+    nearest_capped(
+        kernel,
+        metric,
+        rows,
+        centroids,
+        &norms,
+        d,
+        &mut labels,
+        &mut scores,
+        scratch,
+        tile_floats,
+    );
+    (labels, scores.iter().map(|s| s.to_bits()).collect())
+}
+
+#[test]
+fn tiled_gemm_equals_the_oracle_bitwise_with_five_or_more_tiles() {
+    // One scratch for every call: a tile must not depend on what an earlier, larger call left in it.
+    let mut scratch = vec![f32::NAN; 3];
+    for d in [1, 3, 8, 17, 32] {
+        for k in [17, 33, 100, 256] {
+            for n in [1, 7, 60] {
+                let rows = lcg_values(n * d, (d * 7000 + k * 10 + n) as u64);
+                let centroids = lcg_values(k * d, (d * 7000 + k * 10 + n + 3) as u64);
+                // Widths that leave 5 or more tiles; a cap below n rows (0) still makes progress at width 1.
+                for width in [1, 2, 3, 15, 16, 17, k / 5].into_iter().filter(|&w| k.div_ceil(w) >= 5) {
+                    for tile_floats in [n * width, n * width + n - 1] {
+                        for metric in METRICS {
+                            assert_eq!(
+                                tiled_nearest(Kernel::Gemm, metric, &rows, &centroids, d, tile_floats, &mut scratch),
+                                oracle_nearest(Kernel::Gemm, metric, &rows, &centroids, d),
+                                "d={d} k={k} n={n} width={width} cap={tile_floats} {metric:?}"
+                            );
+                        }
+                    }
+                }
+                for metric in METRICS {
+                    assert_eq!(
+                        tiled_nearest(Kernel::Gemm, metric, &rows, &centroids, d, 0, &mut scratch),
+                        oracle_nearest(Kernel::Gemm, metric, &rows, &centroids, d),
+                        "d={d} k={k} n={n} cap=0 {metric:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tiled_tie_straddling_a_tile_boundary_goes_to_the_lower_as_in_the_oracle() {
+    // k = 40 at width 8 (one row, cap 8): tiles [0, 8), [8, 16), .., [32, 40), five of them.
+    for (tied, want) in [
+        (&[7, 8][..], 7),
+        (&[8, 7][..], 7),
+        (&[15, 16, 39][..], 15),
+        (&[31, 32][..], 31),
+        (&[23, 24, 25][..], 23),
+    ] {
+        let (row, centroids) = tie_fixture(40, tied);
+        for metric in METRICS {
+            let oracle = oracle_nearest(Kernel::Gemm, metric, &row, &centroids, 2);
+            assert_eq!(oracle.0, [want], "{tied:?} {metric:?}: oracle");
+            for tile_floats in [1, 8, 16] {
+                assert_eq!(
+                    tiled_nearest(Kernel::Gemm, metric, &row, &centroids, 2, tile_floats, &mut Vec::new()),
+                    oracle,
+                    "{tied:?} {metric:?} cap={tile_floats}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tiled_all_infinite_and_nan_rows_match_the_oracle() {
+    // Every tile's best is the identity (or a NaN that loses every comparison): label 0 keeps the identity.
+    let k = 21;
+    let mut scratch = Vec::new();
+    for tile_floats in [1, 4, 5] {
+        let near = vec![0.0f32; k];
+        let far = vec![-1e30f32; k];
+        for (metric, centroids) in [(Metric::L2, &near), (Metric::InnerProduct, &far)] {
+            for rows in [[1e30f32], [f32::NAN]] {
+                assert_eq!(
+                    tiled_nearest(Kernel::Gemm, metric, &rows, centroids, 1, tile_floats, &mut scratch),
+                    oracle_nearest(Kernel::Gemm, metric, &rows, centroids, 1),
+                    "{metric:?} rows={rows:?} cap={tile_floats}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gemm_scratch_stays_under_the_tile_cap_whatever_k_is() {
+    let d = 4;
+    let rows = lcg_values(256 * d, 1);
+    let centroids = lcg_values(4096 * d, 2);
+    let norms = centroid_norms(Kernel::Gemm, Metric::L2, &centroids, d);
+    let (mut labels, mut scores) = (vec![0u32; 256], vec![0.0f32; 256]);
+    let mut scratch = Vec::new();
+    nearest(
+        Kernel::Gemm,
+        Metric::L2,
+        &rows,
+        &centroids,
+        &norms,
+        d,
+        &mut labels,
+        &mut scores,
+        &mut scratch,
+    );
+    assert!(
+        scratch.capacity() <= TILE_FLOATS,
+        "scratch holds {} f32, cap {TILE_FLOATS}",
+        scratch.capacity()
+    );
+    // More rows than the cap: one centroid per tile, `rows` f32.
+    let mut big = Vec::new();
+    let many = TILE_FLOATS + 3;
+    let (mut labels, mut scores) = (vec![0u32; many], vec![0.0f32; many]);
+    nearest(
+        Kernel::Gemm,
+        Metric::InnerProduct,
+        &vec![0.5; many],
+        &[1.0, -1.0],
+        &[],
+        1,
+        &mut labels,
+        &mut scores,
+        &mut big,
+    );
+    assert_eq!(big.capacity(), many);
+    assert!(labels.iter().all(|&l| l == 0));
+}
+
+#[test]
+fn gemm_element_is_independent_of_tile_and_split() {
+    // matrixmultiply 0.3.11 accumulates each C element in one chain over the depth: element (i, j) depends on
+    // row i, centroid j, d and the CPU, never on the block's shape or position. Tiling rests on it.
+    let n = 64 + 7;
+    for d in [1, 8, 32, 300] {
+        for k in [17, 256] {
+            let rows = lcg_values(n * d, (d * 31 + k) as u64);
+            let centroids = lcg_values(k * d, (d * 31 + k + 1) as u64);
+            let mut whole = vec![0.0f32; n * k];
+            inner_products(&rows, &centroids, d, &mut whole);
+            for width in [1, 15, 16, 17] {
+                for split in [1, 7, 64] {
+                    for (block, row_chunk) in rows.chunks(split * d).enumerate() {
+                        let m = row_chunk.len() / d;
+                        for j0 in (0..k).step_by(width) {
+                            let j1 = (j0 + width).min(k);
+                            let mut tile = vec![f32::NAN; m * (j1 - j0)];
+                            inner_products(row_chunk, &centroids[j0 * d..j1 * d], d, &mut tile);
+                            for (r, products) in tile.chunks_exact(j1 - j0).enumerate() {
+                                let i = block * split + r;
+                                for (c, product) in products.iter().enumerate() {
+                                    assert_eq!(
+                                        product.to_bits(),
+                                        whole[i * k + j0 + c].to_bits(),
+                                        "d={d} k={k} width={width} split={split} element ({i}, {})",
+                                        j0 + c
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

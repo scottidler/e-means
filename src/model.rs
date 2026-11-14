@@ -124,7 +124,7 @@ impl Model {
         rows.par_chunks(BLOCK_ROWS * self.d)
             .zip(labels.par_chunks_mut(BLOCK_ROWS))
             .zip(distances.par_chunks_mut(BLOCK_ROWS))
-            .for_each(|((block, block_labels), block_distances)| {
+            .for_each_init(Vec::new, |scratch, ((block, block_labels), block_distances)| {
                 assign::nearest(
                     self.kernel,
                     self.metric,
@@ -134,6 +134,7 @@ impl Model {
                     self.d,
                     block_labels,
                     block_distances,
+                    scratch,
                 );
             });
         if self.metric == Metric::InnerProduct {

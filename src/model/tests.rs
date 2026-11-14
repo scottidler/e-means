@@ -147,6 +147,7 @@ fn assign_over_many_blocks_is_thread_count_invariant() {
         2,
         &mut serial_labels,
         &mut serial_distances,
+        &mut Vec::new(),
     );
     for threads in [1, 8] {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
