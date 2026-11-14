@@ -97,6 +97,35 @@ fn assign_rejects_partial_and_non_finite_rows() {
     ));
 }
 
+// `Model::assign` scans each 256-row task for NaN/inf and keeps the minimum offending offset. 300 rows are
+// two tasks, the second short (44 rows); NaN at rows 5 and 290 names row 5, in 1- and 8-thread pools.
+#[test]
+fn assign_non_finite_rows_in_two_tasks_report_the_first_row() {
+    let model = two_cluster_model();
+    let clean: Vec<f32> = (0..300 * 2).map(|i| (i % 23) as f32 * 0.5).collect();
+    let mut both = clean.clone();
+    both[5 * 2 + 1] = f32::NAN;
+    both[290 * 2] = f32::NAN;
+    let mut late = clean.clone();
+    late[290 * 2] = f32::NEG_INFINITY;
+    for threads in [1, 8] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        pool.install(|| {
+            assert_eq!(
+                model.assign(&both).unwrap_err(),
+                Error::NonFiniteInput("row 5 column 1 is NaN".to_string()),
+                "threads={threads}"
+            );
+            assert_eq!(
+                model.assign(&late).unwrap_err(),
+                Error::NonFiniteInput("row 290 column 0 is -inf".to_string()),
+                "threads={threads}"
+            );
+            assert_eq!(model.assign(&clean).unwrap().labels.len(), 300);
+        });
+    }
+}
+
 #[test]
 fn scatter_labels_moves_feed_positions_to_rows() {
     let labels = vec![Some(1), Some(0)];

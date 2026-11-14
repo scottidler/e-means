@@ -254,6 +254,43 @@ fn train_matches_caller_loop_in_pools() {
     }
 }
 
+// `train`'s fused region scans each 256-row task for NaN/inf and keeps the minimum offending offset
+// (`fetch_min`). NaN at gathered positions 5 and 900 of the first batch land in blocks 0 and 3; the error
+// names batch row 5, the message `accumulate` gives for the gathered batch, in 1- and 8-thread pools.
+#[test]
+fn train_non_finite_rows_in_two_tasks_report_the_first_batch_row() {
+    let (d, k, batch, n, seed) = (8, 16, 1024, 3000, 4);
+    let clean = values(n * d, 17, 3.0);
+    let init = clean[..k * d].to_vec();
+    let builder = EMeans::new(d, k).epochs(2.0).batch_size(batch).alpha0(0.2).seed(seed);
+    let first_batch = pass_order(seed, 0, n);
+    let poisoned = |marks: &[(usize, usize, f32)]| {
+        let mut x = clean.clone();
+        for &(position, column, value) in marks {
+            x[first_batch[position] * d + column] = value;
+        }
+        x
+    };
+    let both = poisoned(&[(5, 3, f32::NAN), (900, 6, f32::NAN)]);
+    let late = poisoned(&[(900, 6, f32::INFINITY)]);
+    for threads in [1, 8] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        pool.install(|| {
+            assert_eq!(
+                builder.train_from(&both, &init).unwrap_err(),
+                Error::NonFiniteInput("chunk row 5 column 3 is NaN".to_string()),
+                "threads={threads}"
+            );
+            assert_eq!(
+                builder.train_from(&late, &init).unwrap_err(),
+                Error::NonFiniteInput("chunk row 900 column 6 is inf".to_string()),
+                "threads={threads}"
+            );
+            builder.train_from(&clean, &init).unwrap();
+        });
+    }
+}
+
 // Design criterion: for T in {0.5, 0.1}, labels are None on exactly the unvisited rows.
 // Faiss tests/e_means_test_utils.py:389-484 `test_fractional_epochs_preserve_batches_and_closing_labels`
 #[test]

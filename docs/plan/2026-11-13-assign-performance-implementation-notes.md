@@ -82,3 +82,33 @@
 - Mutation, run once and restored: the cross-tile merge `best < *distance` changed to `<=` fails `tiled_tie_straddling_a_tile_boundary_goes_to_the_lower_as_in_the_oracle` and `tiled_all_infinite_and_nan_rows_match_the_oracle`.
 - `otto ci` exit 0; 138 lib tests, 11 parity, 4 quality, 1 doctest. `cargo test --release --test parity`: 11 passed, determinism and golden digests ok. `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`; no `target_feature`, `mul_add` or `thread_local`.
 - Large-k gate (2^18), 64 threads: `train` 0.669, 0.630, 0.621 s; peak 154548, 154752, 157096 KB; digest `440bf89bb2f83d80`.
+
+## Phase 4: Fused train region
+
+### Design decisions
+- `Trainer::accumulate_indexed(x, ids)` (`src/trainer.rs`, `pub(crate)`): one `par_chunks_mut(BLOCK_ROWS * d)` region over the batch buffer zipped with `ids`, labels and scores, `enumerate`d for the block index, `for_each_init(Vec::new, ..)` for the kernel scratch. Each task gathers its block's rows, scans them with `position(!is_finite)`, and on a hit does `fetch_min` of the batch-wide value offset into an `AtomicUsize` and skips `nearest`. After the join a hit becomes `NonFiniteInput("chunk row R column C is V")`, the exact text `accumulate` gives for the gathered batch. Blocks stay one task per 256-row block.
+- Whole batches only: `accumulate_indexed` `assert!`s `received() == 0` and `ids.len() == due`. They are crate-private invariants `train` always meets, so breaking one is a bug and panics, not a typed error the caller could act on.
+- L2 copies the snapshot from `centroids` unconditionally at the top (`received()` is always 0 here); spherical copies nothing and assigns against the `refresh_readout` readout, per the doc's per-metric rule.
+- The row-order reduction is extracted from `assign_blocks` into `Trainer::reduce(blocks, labels, scores)`, which also extends `pass_labels` and advances `batch.assigned`. Both paths call it, so `accumulate` and `accumulate_indexed` share one reduction and cannot drift. It runs only after a clean join, so on error the batch statistics, `received()` and the captured labels are unchanged.
+- The batch buffer is a new `Trainer::gathered: Vec<f32>` field, reused across batches like `block_labels` / `block_scores` (taken with `mem::take`, put back after).
+- `EMeans::train_rows` calls `trainer.accumulate_indexed(x, ids)`; `gather_into` is gone. Its only other caller, `gather`, now holds the loop itself.
+- `Model::assign` (`src/model.rs`): the serial up-front `position` scan is replaced by the same per-task scan + `fetch_min` + skip inside the existing region. On a hit the labels already computed are dropped and the error is `row R column C is V`, as before.
+- New tests, named so `cargo test non_finite` runs them: `config::tests::train_non_finite_rows_in_two_tasks_report_the_first_batch_row` (d=8, B=1024, n=3000, NaN at gathered positions 5 and 900 of the first batch, mapped through `pass_order(seed, 0, n)`; also inf at 900 alone names row 900; 1- and 8-thread pools), `model::tests::assign_non_finite_rows_in_two_tasks_report_the_first_row` (n=300, NaN at rows 5 and 290; -inf at 290 alone names row 290; both pools), `trainer::tests::accumulate_indexed_non_finite_row_changes_nothing_and_matches_accumulate` (both metrics: after the error `received()` is 0 and counts are zero, then the same batches fed through `accumulate_indexed` equal `accumulate` of the gathered rows bitwise: centroids, objectives, labels).
+
+### Deviations
+- The `train` NaN test uses `train_from` with a clean init instead of `train`: `train` draws its init from the rows, and a NaN row in the init would fail at `begin` with an init message, not the batch message under test. Same pass-0 permutation, same fused path.
+- The `fetch_min` mutation was also run on `Model::assign` (not required): `assign_non_finite_rows_in_two_tasks_report_the_first_row` fails at threads=1 with `row 290 column 0 is NaN`.
+
+### Tradeoffs
+- `Relaxed` ordering on the `AtomicUsize`: the rayon join is the synchronization point before `into_inner`, and `fetch_min` is commutative, so no stronger ordering buys anything.
+- `assert!` vs a typed error for a non-whole batch: the entry point is crate-private and `train` is its only caller; a typed error would be an unreachable branch to test.
+- A failing task still gathers its whole block before scanning (the error reads the value back from the buffer): one block's copy on the error path only, and gather then scan keeps one pass over `x` on the hot path.
+
+### Open questions
+- None.
+
+#### Recorded observations
+- Mutation, run once and restored: `first_bad.fetch_min(..)` changed to `first_bad.store(..)` in `accumulate_indexed` fails `train_non_finite_rows_in_two_tasks_report_the_first_batch_row` at threads=1 (`left: NonFiniteInput("chunk row 900 column 6 is NaN")`, `right: NonFiniteInput("chunk row 5 column 3 is NaN")`).
+- `otto ci` exit 0, `All CI checks passed!`; 141 lib tests, 11 parity (determinism and golden digests ok), 4 quality, 1 doctest. `rg -n 'gather_into' src/config.rs` prints nothing (exit 1). `rg -c '\bunsafe (\{|fn|impl|trait|extern)' src/`: `src/assign.rs:1`.
+- `otto bench` before / after: `train/n100000_d32_k256_t5` 41.879 -> 29.230 ms; `train/n100000_d8_k256_t5` 97.075 -> 95.025 ms; `Model::assign` benches 7-59% faster (the serial finite scan left the critical path). Full tables in the design doc, Phase 4.
+- `otto h2h` after: every d=32 cell passes (train 1.089 / 1.155 / 1.078 at 1 / 8 / 64 threads; assign 1.097 at 1 thread, 1.237 at 64); the 5 d=8 default cells still miss (Direct is Phase 6). `assign-d8-default-1t` printed 52.03 ms in the full run, which is a load mode: interleaved re-runs gave 44.2 ms for both `684cfe0` and this phase.

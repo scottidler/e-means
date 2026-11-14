@@ -5,6 +5,8 @@
 //! `REF/e_means.py:531-564`. Spherical mode follows `REF/e_means.py:217-241`, `:303-307`, `:432-434` and
 //! `:512-529`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use log::{debug, trace};
 use rayon::prelude::*;
 
@@ -62,6 +64,8 @@ pub struct Trainer {
     batch: BatchAccumulator,
     /// Rows of a partial block, waiting for the next chunk.
     carry: Vec<f32>,
+    /// `accumulate_indexed`'s batch buffer: the batch's rows gathered from `x`, scratch between batches.
+    gathered: Vec<f32>,
     block_labels: Vec<u32>,
     /// Per-row score of the block's assignment: squared distance, or inner product in spherical mode.
     block_scores: Vec<f32>,
@@ -134,6 +138,7 @@ impl Trainer {
             centroids,
             batch: BatchAccumulator::new(k, d),
             carry: Vec::with_capacity(BLOCK_ROWS.min(recipe.batch_size) * d),
+            gathered: Vec::new(),
             block_labels: Vec::new(),
             block_scores: Vec::new(),
             pass_counts: vec![0; k],
@@ -462,6 +467,87 @@ impl Trainer {
         Ok(())
     }
 
+    /// Assign and add one whole batch of rows of `x` (row-major, `d` columns), given by `ids`, in one
+    /// parallel region: each task gathers its 256-row block into the batch buffer, scans it for NaN/inf,
+    /// and assigns it against the snapshot. `train` only; the caller-driven path is `accumulate`.
+    ///
+    /// Bitwise equal to `accumulate` of the gathered rows: blocks are cut at 256 rows from the batch start,
+    /// and the reduction runs in row order on this thread. On a NaN or infinite value the error names the
+    /// first offending batch row, the same message `accumulate` gives, and the batch statistics, `received`
+    /// and the captured labels are unchanged; only the L2 snapshot is refreshed, as `accumulate` does.
+    pub(crate) fn accumulate_indexed(&mut self, x: &[f32], ids: &[usize]) -> Result<()> {
+        trace!(
+            "Trainer::accumulate_indexed: rows={} step={} epoch={}",
+            ids.len(),
+            self.step,
+            self.epoch
+        );
+        self.require_running()?;
+        let due = self.require_batch_due()?;
+        assert_eq!(self.received(), 0, "accumulate_indexed feeds whole batches only");
+        assert_eq!(ids.len(), due, "accumulate_indexed takes exactly the batch's rows");
+        if self.metric == Metric::L2 {
+            self.snapshot.copy_from_slice(&self.centroids);
+        }
+        let d = self.d;
+        let mut gathered = std::mem::take(&mut self.gathered);
+        let mut labels = std::mem::take(&mut self.block_labels);
+        let mut scores = std::mem::take(&mut self.block_scores);
+        gathered.resize(due * d, 0.0);
+        labels.resize(due, 0);
+        scores.resize(due, 0.0);
+
+        let first_bad = AtomicUsize::new(usize::MAX);
+        let (kernel, metric, snapshot) = (self.kernel, self.metric, &self.snapshot);
+        let norms = assign::centroid_norms(kernel, metric, snapshot, d);
+        gathered
+            .par_chunks_mut(BLOCK_ROWS * d)
+            .zip(ids.par_chunks(BLOCK_ROWS))
+            .zip(labels.par_chunks_mut(BLOCK_ROWS))
+            .zip(scores.par_chunks_mut(BLOCK_ROWS))
+            .enumerate()
+            .for_each_init(
+                Vec::new,
+                |scratch, (block, (((rows, block_ids), block_labels), block_scores))| {
+                    for (row, &i) in rows.chunks_exact_mut(d).zip(block_ids) {
+                        row.copy_from_slice(&x[i * d..(i + 1) * d]);
+                    }
+                    if let Some(at) = rows.iter().position(|v| !v.is_finite()) {
+                        first_bad.fetch_min(block * BLOCK_ROWS * d + at, Ordering::Relaxed);
+                        return;
+                    }
+                    assign::nearest(
+                        kernel,
+                        metric,
+                        rows,
+                        snapshot,
+                        &norms,
+                        d,
+                        block_labels,
+                        block_scores,
+                        scratch,
+                    );
+                },
+            );
+
+        let at = first_bad.into_inner();
+        let result = if at == usize::MAX {
+            self.reduce(gathered.chunks(BLOCK_ROWS * d), &labels, &scores);
+            Ok(())
+        } else {
+            Err(Error::NonFiniteInput(format!(
+                "chunk row {} column {} is {}",
+                at / d,
+                at % d,
+                gathered[at]
+            )))
+        };
+        self.gathered = gathered;
+        self.block_labels = labels;
+        self.block_scores = scores;
+        result
+    }
+
     /// Assign complete blocks against the snapshot, one block per task on the current `rayon` pool, then add
     /// them to the batch in row order on this thread.
     ///
@@ -507,8 +593,17 @@ impl Trainer {
                 );
             });
 
+        self.reduce(blocks.iter().copied(), &labels, &scores);
+        self.block_labels = labels;
+        self.block_scores = scores;
+    }
+
+    /// Add assigned blocks to the batch in row order on this thread: counts, f64 sums, the objective, and
+    /// the captured labels. `labels` and `scores` hold one entry per row of `blocks`, in order.
+    fn reduce<'a>(&mut self, blocks: impl IntoIterator<Item = &'a [f32]>, labels: &[u32], scores: &[f32]) {
+        let d = self.d;
         let mut at = 0;
-        for &block in blocks {
+        for block in blocks {
             let rows = block.len() / d;
             if self.metric == Metric::InnerProduct {
                 // `2 - 2 * ip` per row, as `2 * rows` per block plus the f32 values `-2 * ip`
@@ -532,12 +627,11 @@ impl Trainer {
             }
             at += rows;
         }
+        debug_assert_eq!(at, labels.len(), "every label belongs to a block row");
         if let Some(pass_labels) = self.pass_labels.as_mut() {
-            pass_labels.extend_from_slice(&labels);
+            pass_labels.extend_from_slice(labels);
         }
-        self.batch.assigned += total;
-        self.block_labels = labels;
-        self.block_scores = scores;
+        self.batch.assigned += labels.len();
     }
 
     /// Algorithm 1 line 8: the EMA of masses and centroids (`REF/e_means.py:456-505`).

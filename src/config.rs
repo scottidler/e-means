@@ -243,13 +243,11 @@ impl EMeans {
         let mut trainer = self.begin(n, init)?;
         let batch = trainer.batch_rows();
         let passes = trainer.recipe().epoch_rows.clone();
-        let mut rows = Vec::with_capacity(batch * d);
         let mut last_order = Vec::new();
         for (pass, &pass_rows) in passes.iter().enumerate() {
             let order = Stream::new(self.seed, StreamId::Pass(pass as u64)).permutation(n);
             for ids in order[..pass_rows].chunks(batch) {
-                gather_into(&mut rows, x, ids, d);
-                trainer.accumulate(&rows)?;
+                trainer.accumulate_indexed(x, ids)?;
                 trainer.update()?;
             }
             trainer.end_epoch()?;
@@ -280,16 +278,10 @@ impl EMeans {
 /// The rows `ids` of `x`, in that order.
 fn gather(x: &[f32], ids: &[usize], d: usize) -> Vec<f32> {
     let mut rows = Vec::with_capacity(ids.len() * d);
-    gather_into(&mut rows, x, ids, d);
-    rows
-}
-
-/// Replace the contents of `rows` with the rows `ids` of `x`, in that order.
-fn gather_into(rows: &mut Vec<f32>, x: &[f32], ids: &[usize], d: usize) {
-    rows.clear();
     for &i in ids {
         rows.extend_from_slice(&x[i * d..(i + 1) * d]);
     }
+    rows
 }
 
 #[cfg(test)]

@@ -341,6 +341,54 @@ fn non_finite_row_is_rejected_before_anything_changes() {
     assert_eq!(model.centroids(), &[1.5, 1.5, 10.0, 10.0]);
 }
 
+// `accumulate_indexed` rejects a NaN before the batch statistics move: after the error the same batch fed
+// cleanly through it gives the bits `accumulate` gives on the gathered rows.
+#[test]
+fn accumulate_indexed_non_finite_row_changes_nothing_and_matches_accumulate() {
+    let d = 3;
+    let x = lcg_values(700 * d, 9, 2.0);
+    let init = x[..4 * d].to_vec();
+    let ids: Vec<usize> = (0..600).map(|i| (i * 3 + 5) % 700).collect();
+    let builder = EMeans::new(d, 4).epochs(1.0).batch_size(600).alpha0(0.3);
+    for spherical in [false, true] {
+        let builder = builder.clone().spherical(spherical);
+        let mut bad = x.clone();
+        bad[ids[300] * d + 2] = f32::NAN;
+        let mut indexed = builder.begin(700, &init).unwrap();
+        assert_eq!(
+            indexed.accumulate_indexed(&bad, &ids[..600]).unwrap_err(),
+            Error::NonFiniteInput("chunk row 300 column 2 is NaN".to_string())
+        );
+        assert_eq!(indexed.received(), 0, "spherical={spherical}");
+        assert!(indexed.batch.counts.iter().all(|&c| c == 0));
+        indexed.accumulate_indexed(&x, &ids[..600]).unwrap();
+        indexed.update().unwrap();
+        indexed.accumulate_indexed(&x, &ids[..100]).unwrap();
+        indexed.update().unwrap();
+        indexed.end_epoch().unwrap();
+
+        let mut caller = builder.begin(700, &init).unwrap();
+        let gathered: Vec<f32> = ids
+            .iter()
+            .flat_map(|&i| x[i * d..(i + 1) * d].iter().copied())
+            .collect();
+        caller.accumulate(&gathered).unwrap();
+        caller.update().unwrap();
+        caller.accumulate(&gathered[..100 * d]).unwrap();
+        caller.update().unwrap();
+        caller.end_epoch().unwrap();
+
+        let (indexed, caller) = (indexed.finalize().unwrap(), caller.finalize().unwrap());
+        assert_eq!(
+            bits(indexed.centroids()),
+            bits(caller.centroids()),
+            "spherical={spherical}"
+        );
+        assert_eq!(objectives(&indexed), objectives(&caller), "spherical={spherical}");
+        assert_eq!(indexed.labels(), caller.labels(), "spherical={spherical}");
+    }
+}
+
 #[test]
 fn overflowing_or_ragged_chunk_is_rejected_unchanged() {
     let builder = EMeans::new(2, 2).epochs(1.0).batch_size(2).alpha0(0.5);

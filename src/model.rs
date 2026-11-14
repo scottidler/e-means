@@ -1,6 +1,8 @@
 //! The trained model: final centroids, last-pass labels, per-pass statistics and the recipe that produced
 //! them, plus final-nearest assignment.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use log::debug;
 use rayon::prelude::*;
 
@@ -108,7 +110,39 @@ impl Model {
                 self.d
             )));
         }
-        if let Some(at) = rows.iter().position(|v| !v.is_finite()) {
+        let n = rows.len() / self.d;
+        let mut labels = vec![0; n];
+        let mut distances = vec![0.0; n];
+        let norms = assign::centroid_norms(self.kernel, self.metric, &self.centroids, self.d);
+        let first_bad = AtomicUsize::new(usize::MAX);
+        // One block per task on the current `rayon` pool; each row's result depends only on the row. Each task
+        // scans its block for NaN/inf first and skips it on a hit; the error names the lowest offending value.
+        rows.par_chunks(BLOCK_ROWS * self.d)
+            .zip(labels.par_chunks_mut(BLOCK_ROWS))
+            .zip(distances.par_chunks_mut(BLOCK_ROWS))
+            .enumerate()
+            .for_each_init(
+                Vec::new,
+                |scratch, (index, ((block, block_labels), block_distances))| {
+                    if let Some(at) = block.iter().position(|v| !v.is_finite()) {
+                        first_bad.fetch_min(index * BLOCK_ROWS * self.d + at, Ordering::Relaxed);
+                        return;
+                    }
+                    assign::nearest(
+                        self.kernel,
+                        self.metric,
+                        block,
+                        &self.centroids,
+                        &norms,
+                        self.d,
+                        block_labels,
+                        block_distances,
+                        scratch,
+                    );
+                },
+            );
+        let at = first_bad.into_inner();
+        if at != usize::MAX {
             return Err(Error::NonFiniteInput(format!(
                 "row {} column {} is {}",
                 at / self.d,
@@ -116,27 +150,6 @@ impl Model {
                 rows[at]
             )));
         }
-        let n = rows.len() / self.d;
-        let mut labels = vec![0; n];
-        let mut distances = vec![0.0; n];
-        let norms = assign::centroid_norms(self.kernel, self.metric, &self.centroids, self.d);
-        // One block per task on the current `rayon` pool; each row's result depends only on the row.
-        rows.par_chunks(BLOCK_ROWS * self.d)
-            .zip(labels.par_chunks_mut(BLOCK_ROWS))
-            .zip(distances.par_chunks_mut(BLOCK_ROWS))
-            .for_each_init(Vec::new, |scratch, ((block, block_labels), block_distances)| {
-                assign::nearest(
-                    self.kernel,
-                    self.metric,
-                    block,
-                    &self.centroids,
-                    &norms,
-                    self.d,
-                    block_labels,
-                    block_distances,
-                    scratch,
-                );
-            });
         if self.metric == Metric::InnerProduct {
             for distance in &mut distances {
                 *distance = 2.0 - 2.0 * *distance;
