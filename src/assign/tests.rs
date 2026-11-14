@@ -1067,3 +1067,136 @@ fn transpose_into_lanes_rejects_a_partial_group() {
     let mut layout = vec![0.0f32; 2 * (LANES - 1)];
     transpose_into_lanes(&[0.0f32; 2 * (LANES - 1)], 2, &mut layout);
 }
+
+/// The unfused `lane_scan_l2`: every L2 score computed and clamped as `oracle_gemm_nearest` does
+/// (`if e < 0.0 { e = 0.0 }`), then a sequential strict scan for the first index at the smallest.
+fn sequential_l2_scan(products: &[f32], norms: &[f32], row_norm: f32) -> (u32, f32) {
+    let scores: Vec<f32> = products
+        .iter()
+        .zip(norms)
+        .map(|(&p, &cn)| {
+            let mut e = row_norm + cn - 2.0 * p;
+            if e < 0.0 {
+                e = 0.0;
+            }
+            e
+        })
+        .collect();
+    sequential_scan(&scores, f32::INFINITY, |v, b| v < b)
+}
+
+fn assert_lane_scan_l2_is_sequential(products: &[f32], norms: &[f32], row_norm: f32, context: &str) {
+    let got = lane_scan_l2(products, norms, row_norm);
+    let want = sequential_l2_scan(products, norms, row_norm);
+    assert_eq!((got.0, got.1.to_bits()), (want.0, want.1.to_bits()), "{context}");
+}
+
+// A tie across lanes where the later lane holds the lower id: id 32 (lane 0) and id 1 (lane 1) share the
+// minimum. The lane merge must hand the tie to id 1, a sequential scan's first index.
+#[test]
+fn lane_scan_l2_cross_lane_tie_goes_to_the_lower_id_in_a_later_lane() {
+    let products = [0.0f32; 48];
+    let mut norms = [5.0f32; 48];
+    norms[32] = 1.0;
+    norms[1] = 1.0;
+    assert_eq!(lane_scan_l2(&products, &norms, 0.0), (1, 1.0));
+    assert_lane_scan_l2_is_sequential(&products, &norms, 0.0, "tie at ids 1 and 32");
+}
+
+// The tail past the last full group (k mod 16 != 0) clamps a negative expansion to +0.0, as the groups do.
+#[test]
+fn lane_scan_l2_tail_clamps_a_negative_expansion_to_zero() {
+    // 17 scores: one group at 3.0, then a tail of `0 + 0 - 2 * 1 = -2`, clamped.
+    let mut products = [0.0f32; 17];
+    let mut norms = [3.0f32; 17];
+    products[16] = 1.0;
+    norms[16] = 0.0;
+    let (id, best) = lane_scan_l2(&products, &norms, 0.0);
+    assert_eq!((id, best.to_bits()), (16, 0.0f32.to_bits()));
+    assert_lane_scan_l2_is_sequential(&products, &norms, 0.0, "negative tail");
+    // Only a tail: no full group at all.
+    assert_eq!(lane_scan_l2(&[1.0], &[0.0], 0.0).1.to_bits(), 0.0f32.to_bits());
+}
+
+// The fused clamp is the oracle's `e < 0.0` over all of f32, bit for bit: a `-0.0` expansion is not below
+// zero and passes through as `-0.0`, in a group and in the tail. (`nearest` never feeds it one: its norms
+// fold from `+0.0`; this pins the fused expression against the unfused one directly.)
+#[test]
+fn lane_scan_l2_clamp_is_the_oracle_clamp_bitwise_at_negative_zero() {
+    // Every score `(-0 + -0) - 2 * 0 = -0.0`, all in groups.
+    let products = [0.0f32; 32];
+    let norms = [-0.0f32; 32];
+    let (id, best) = lane_scan_l2(&products, &norms, -0.0);
+    assert_eq!((id, best.to_bits()), (0, (-0.0f32).to_bits()), "groups");
+    assert_lane_scan_l2_is_sequential(&products, &norms, -0.0, "groups at -0.0");
+    // A group at `-0 + 1 = 1`, then a tail of `-0.0`.
+    let products = [0.0f32; 17];
+    let mut norms = [1.0f32; 17];
+    norms[16] = -0.0;
+    let (id, best) = lane_scan_l2(&products, &norms, -0.0);
+    assert_eq!((id, best.to_bits()), (16, (-0.0f32).to_bits()), "tail");
+    assert_lane_scan_l2_is_sequential(&products, &norms, -0.0, "tail at -0.0");
+}
+
+// Tie-heavy data over lengths that end in every tail size, with negative expansions, `-0.0` and NaN.
+#[test]
+fn lane_scan_l2_equals_the_unfused_sequential_scan_bitwise_on_tie_heavy_data() {
+    for len in (0..=70).chain([255, 256, 257]) {
+        for seed in 0..20u64 {
+            let products: Vec<f32> = lcg_values(len, seed * 37 + len as u64)
+                .iter()
+                .map(|v| (v * 2.0).floor())
+                .collect();
+            let mut norms: Vec<f32> = lcg_values(len, seed * 41 + len as u64 + 7)
+                .iter()
+                .map(|v| (v * 2.0).floor().abs())
+                .collect();
+            let row_norm = match seed % 4 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => 1.0,
+                _ => 2.0,
+            };
+            if seed % 5 == 1 && len > 3 {
+                norms[len / 2] = f32::NAN;
+            }
+            if seed % 7 == 2 {
+                norms.iter_mut().step_by(3).for_each(|v| *v = -0.0);
+            }
+            assert_lane_scan_l2_is_sequential(&products, &norms, row_norm, &format!("len={len} seed={seed}"));
+        }
+    }
+    let inf = [f32::INFINITY; 20];
+    assert_eq!(lane_scan_l2(&[0.0; 20], &inf, 0.0), (0, f32::INFINITY));
+}
+
+// A reused Direct scratch that starts non-empty but short grows to exactly one tile's layout, not past it.
+#[test]
+fn direct_scratch_grows_a_short_reused_buffer_to_exactly_the_layout() {
+    let (d, k) = (4, LANES);
+    let rows = lcg_values(3 * d, 21);
+    let centroids = lcg_values(k * d, 22);
+    for metric in METRICS {
+        let mut scratch = vec![7.0f32; 3];
+        assert_eq!(scratch.capacity(), 3);
+        let (mut labels, mut scores) = (vec![u32::MAX; 3], vec![f32::NAN; 3]);
+        nearest(
+            Kernel::Direct,
+            metric,
+            &rows,
+            &centroids,
+            &[],
+            d,
+            &mut labels,
+            &mut scores,
+            &mut scratch,
+        );
+        assert_eq!(scratch.len(), LANES * d, "{metric:?}");
+        assert_eq!(scratch.capacity(), LANES * d, "{metric:?}");
+        assert_eq!(
+            (labels, scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>()),
+            oracle_nearest(Kernel::Direct, metric, &rows, &centroids, d),
+            "{metric:?}"
+        );
+    }
+}

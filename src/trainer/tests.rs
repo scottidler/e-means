@@ -1178,3 +1178,96 @@ fn assign_blocks_split_into_tasks_matches_one_task_per_block() {
         assert_eq!(run(threads), want, "threads {threads}");
     }
 }
+
+/// A test-only `log` sink: records the messages logged on a thread while that thread runs `captured`.
+/// `reduce` reports its owner count only through its `Trainer::reduce_partitioned` trace line, and the
+/// owner count moves no result bit, so the line is the one place the threshold dispatch shows.
+mod trace_capture {
+    use std::cell::RefCell;
+    use std::sync::Once;
+
+    thread_local! {
+        static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    struct Sink;
+
+    impl log::Log for Sink {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            LINES.with(|lines| lines.borrow().is_some())
+        }
+
+        fn log(&self, record: &log::Record) {
+            LINES.with(|lines| {
+                if let Some(lines) = lines.borrow_mut().as_mut() {
+                    lines.push(record.args().to_string());
+                }
+            });
+        }
+
+        fn flush(&self) {}
+    }
+
+    static SINK: Sink = Sink;
+
+    /// Run `f` on this thread and return what it logged on this thread.
+    pub(super) fn captured(f: impl FnOnce()) -> Vec<String> {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&SINK).expect("no other logger in the lib tests");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+        f();
+        LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+/// The owner count of the one `reduce_partitioned` call in `lines`.
+fn logged_owners(lines: &[String]) -> usize {
+    let owners: Vec<usize> = lines
+        .iter()
+        .filter(|line| line.starts_with("Trainer::reduce_partitioned:"))
+        .map(|line| line.rsplit("owners=").next().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(owners.len(), 1, "one reduce_partitioned line in {lines:?}");
+    owners[0]
+}
+
+// The dispatch at its edge: `rows * d` exactly `PARALLEL_REDUCE_VALUES` reduces with one owner per pool
+// thread, one value below it with a single owner; both equal the oracle bitwise.
+#[test]
+fn reduce_owner_count_switches_exactly_at_the_parallel_threshold() {
+    let (k, threads) = (100, 4);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    for metric in [Metric::L2, Metric::InnerProduct] {
+        // (rows, d, owners): at the threshold, and the largest batch below it.
+        for (rows, d, owners) in [
+            (PARALLEL_REDUCE_VALUES / 16, 16, threads),
+            ((PARALLEL_REDUCE_VALUES - 1) / 3, 3, 1),
+            (PARALLEL_REDUCE_VALUES / 16 - 1, 16, 1),
+        ] {
+            assert_eq!(rows * d >= PARALLEL_REDUCE_VALUES, owners > 1);
+            let x = lcg_values(rows * d, 60 + rows as u64, 3.0);
+            let labels: Vec<u32> = (0..rows).map(|i| (i * 37 % k) as u32).collect();
+            let scores = lcg_values(rows, 61, 1.0);
+            let blocks: Vec<&[f32]> = x.chunks(BLOCK_ROWS * d).collect();
+            let trainer = || {
+                let init = lcg_values(k * d, 5, 1.0);
+                EMeans::new(d, k)
+                    .epochs(1.0)
+                    .batch_size(rows)
+                    .spherical(metric == Metric::InnerProduct)
+                    .begin(rows, &init)
+                    .unwrap()
+            };
+            let mut want = trainer();
+            want.oracle_reduce(blocks.iter().copied(), &labels, &scores);
+            let mut got = trainer();
+            let lines = pool.install(|| trace_capture::captured(|| got.reduce(&blocks, &labels, &scores)));
+            let context = format!("{metric:?} rows={rows} d={d}");
+            assert_eq!(logged_owners(&lines), owners, "{context}");
+            assert_same_reduction(&got, &want, &context);
+        }
+    }
+}
