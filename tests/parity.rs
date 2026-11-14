@@ -558,3 +558,71 @@ fn determinism_across_thread_counts_and_chunkings() {
         }
     }
 }
+
+/// `BLAS_THRESHOLD` in `src/assign.rs`, which is crate-private: a fixture with `batch_size * d` below it
+/// runs `Kernel::Direct`.
+const BLAS_THRESHOLD: usize = 128_000;
+
+/// Golden digests of every fixture that runs `Kernel::Direct`: FNV-1a of the bits of the final centroids
+/// (f32), of the last-pass labels (u32), and of the per-pass objectives (f64), captured from `main` at
+/// `5f0b62d` before any kernel change. Direct is plain IEEE f32/f64 arithmetic with no FMA and no
+/// reassociation, so these hold on any x86-64 runner. The Gemm fixtures are not here: sgemm dispatches on
+/// the CPU (AVX-512, FMA, fallback), so their bits are machine-specific and the oracle tests in
+/// `src/assign/tests.rs` guard them on the running machine instead.
+const DIRECT_GOLDEN: &[(&str, [&str; 3])] = &[
+    (
+        "separated_d8",
+        ["45ebfe1584e7672b", "3c9425902aad3ccb", "84244f7292fd70e8"],
+    ),
+    (
+        "separated_d32",
+        ["aeef8f9aa6ed06db", "c329b2ccef6e61c7", "0e13bdcb2ace94d6"],
+    ),
+    (
+        "separated_d8_t2_5",
+        ["d706b48717f8078f", "e8722c3f9f138b09", "afe19f9e087f53db"],
+    ),
+    (
+        "separated_spherical_d32",
+        ["12c13032fab12274", "efa42860106a990b", "66f54e271f567722"],
+    ),
+    (
+        "separated_d2",
+        ["97747104639fafa6", "2e5fc4b11a2b05db", "8ec29a6df3a35d70"],
+    ),
+    (
+        "oversplit",
+        ["4f4a30e8a8f3fcf5", "e49b4d688eaede09", "d08c7e2ec7939ada"],
+    ),
+];
+
+fn digests(run: &Run) -> [String; 3] {
+    [
+        fnv1a_f32(&run.centroids),
+        fnv1a_u32(&run.labels),
+        fnv1a(run.objectives.iter().flat_map(|o| o.to_bits().to_le_bytes())),
+    ]
+}
+
+// Phase 1 guard: a kernel change that moves one Direct bit fails here, on any machine.
+#[test]
+fn direct_fixtures_match_their_golden_digests() {
+    let direct: Vec<String> = manifest()
+        .fixtures
+        .iter()
+        .filter(|fx| fx.batch_size * fx.d < BLAS_THRESHOLD)
+        .map(|fx| fx.name.clone())
+        .collect();
+    let golden: Vec<&str> = DIRECT_GOLDEN.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        direct, golden,
+        "the manifest's Direct fixtures and DIRECT_GOLDEN must list the same names"
+    );
+    for (name, want) in DIRECT_GOLDEN {
+        let got = digests(&rust_run(&fixture(name)));
+        assert_eq!(
+            &got, want,
+            "{name}: centroid, label and objective digests moved; a Direct result bit changed"
+        );
+    }
+}

@@ -287,3 +287,275 @@ fn disjoint_sees_overlap_adjacency_and_empty_slices() {
     assert!(disjoint(&values[0..4], &values[4..8]));
     assert!(disjoint(&values[2..2], &values[0..8]));
 }
+
+// Oracles: today's scalar kernels, copied verbatim. Later phases replace the production scans with lane
+// versions; every one is compared with `to_bits` against these. They are never edited to follow the code.
+
+fn oracle_direct_l2(rows: &[f32], centroids: &[f32], d: usize, labels: &mut [u32], distances: &mut [f32]) {
+    for ((row, label), distance) in rows.chunks_exact(d).zip(labels.iter_mut()).zip(distances.iter_mut()) {
+        let mut best = 0usize;
+        let mut best_distance = f32::INFINITY;
+        for (j, centroid) in centroids.chunks_exact(d).enumerate() {
+            let squared = squared_l2(row, centroid);
+            if squared < best_distance {
+                best = j;
+                best_distance = squared;
+            }
+        }
+        *label = best as u32;
+        *distance = best_distance;
+    }
+}
+
+fn oracle_direct_inner_product(rows: &[f32], centroids: &[f32], d: usize, labels: &mut [u32], products: &mut [f32]) {
+    for ((row, label), product) in rows.chunks_exact(d).zip(labels.iter_mut()).zip(products.iter_mut()) {
+        let mut best = 0usize;
+        let mut best_product = f32::NEG_INFINITY;
+        for (j, centroid) in centroids.chunks_exact(d).enumerate() {
+            let ip = inner_product(row, centroid);
+            if ip > best_product {
+                best = j;
+                best_product = ip;
+            }
+        }
+        *label = best as u32;
+        *product = best_product;
+    }
+}
+
+fn oracle_gemm_nearest(
+    metric: Metric,
+    rows: &[f32],
+    centroids: &[f32],
+    d: usize,
+    labels: &mut [u32],
+    scores: &mut [f32],
+) {
+    if labels.is_empty() {
+        return;
+    }
+    let k = centroids.len() / d;
+    let mut tile = vec![0.0f32; labels.len() * k];
+    inner_products(rows, centroids, d, &mut tile);
+    let per_row = rows
+        .chunks_exact(d)
+        .zip(tile.chunks_exact(k))
+        .zip(labels.iter_mut().zip(scores.iter_mut()));
+    match metric {
+        Metric::L2 => {
+            let centroid_norms: Vec<f32> = centroids.chunks_exact(d).map(|c| inner_product(c, c)).collect();
+            for ((row, products), (label, distance)) in per_row {
+                let row_norm = inner_product(row, row);
+                let mut best = 0usize;
+                let mut best_distance = f32::INFINITY;
+                for (j, (&ip, &centroid_norm)) in products.iter().zip(&centroid_norms).enumerate() {
+                    let mut expanded = row_norm + centroid_norm - 2.0 * ip;
+                    if expanded < 0.0 {
+                        expanded = 0.0;
+                    }
+                    if expanded < best_distance {
+                        best = j;
+                        best_distance = expanded;
+                    }
+                }
+                *label = best as u32;
+                *distance = best_distance;
+            }
+        }
+        Metric::InnerProduct => {
+            for ((_, products), (label, product)) in per_row {
+                let mut best = 0usize;
+                let mut best_product = f32::NEG_INFINITY;
+                for (j, &ip) in products.iter().enumerate() {
+                    if ip > best_product {
+                        best = j;
+                        best_product = ip;
+                    }
+                }
+                *label = best as u32;
+                *product = best_product;
+            }
+        }
+    }
+}
+
+/// The oracle for `(kernel, metric)`, labels and `to_bits` of the scores.
+fn oracle_nearest(kernel: Kernel, metric: Metric, rows: &[f32], centroids: &[f32], d: usize) -> (Vec<u32>, Vec<u32>) {
+    let n = rows.len() / d;
+    let mut labels = vec![u32::MAX; n];
+    let mut scores = vec![f32::NAN; n];
+    match (kernel, metric) {
+        (Kernel::Direct, Metric::L2) => oracle_direct_l2(rows, centroids, d, &mut labels, &mut scores),
+        (Kernel::Direct, Metric::InnerProduct) => {
+            oracle_direct_inner_product(rows, centroids, d, &mut labels, &mut scores)
+        }
+        (Kernel::Gemm, metric) => oracle_gemm_nearest(metric, rows, centroids, d, &mut labels, &mut scores),
+    }
+    (labels, scores.iter().map(|s| s.to_bits()).collect())
+}
+
+/// `nearest`, labels and `to_bits` of the scores.
+fn production_nearest(
+    kernel: Kernel,
+    metric: Metric,
+    rows: &[f32],
+    centroids: &[f32],
+    d: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let n = rows.len() / d;
+    let mut labels = vec![u32::MAX; n];
+    let mut scores = vec![f32::NAN; n];
+    nearest(kernel, metric, rows, centroids, d, &mut labels, &mut scores);
+    (labels, scores.iter().map(|s| s.to_bits()).collect())
+}
+
+const KERNELS: [Kernel; 2] = [Kernel::Direct, Kernel::Gemm];
+const METRICS: [Metric; 2] = [Metric::L2, Metric::InnerProduct];
+
+/// Every (kernel, metric): `nearest` equals its oracle bitwise, and the oracle's labels are `want`.
+fn assert_matches_oracle(rows: &[f32], centroids: &[f32], d: usize, want: &[u32], what: &str) {
+    for kernel in KERNELS {
+        for metric in METRICS {
+            let oracle = oracle_nearest(kernel, metric, rows, centroids, d);
+            assert_eq!(oracle.0, want, "{what}: oracle labels, {kernel:?} {metric:?}");
+            assert_eq!(
+                production_nearest(kernel, metric, rows, centroids, d),
+                oracle,
+                "{what}: nearest differs from its oracle, {kernel:?} {metric:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nearest_equals_the_oracles_bitwise_on_random_data() {
+    let n = 60;
+    for d in [1, 3, 8, 17, 32] {
+        for k in [1, 2, 15, 16, 17, 31, 33, 100] {
+            let rows = lcg_values(n * d, (d * 1000 + k) as u64);
+            let centroids = lcg_values(k * d, (d * 1000 + k + 7) as u64);
+            for kernel in KERNELS {
+                for metric in METRICS {
+                    assert_eq!(
+                        production_nearest(kernel, metric, &rows, &centroids, d),
+                        oracle_nearest(kernel, metric, &rows, &centroids, d),
+                        "d={d} k={k} {kernel:?} {metric:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// k centroids on a line (d = 2): every centroid is the far default `(-5 - j, 0)` except those in `tied`,
+/// which sit at `(3, 0)`. Row `(1, 0)`: under L2 the tied centroids are the unique nearest, all at squared
+/// distance 4; under inner product they have the unique largest product, 3. Small integers, so every kernel
+/// computes every score exactly.
+fn tie_fixture(k: usize, tied: &[usize]) -> (Vec<f32>, Vec<f32>) {
+    let mut centroids = Vec::with_capacity(k * 2);
+    for j in 0..k {
+        let x = if tied.contains(&j) { 3.0 } else { -5.0 - j as f32 };
+        centroids.extend([x, 0.0]);
+    }
+    (vec![1.0, 0.0], centroids)
+}
+
+#[test]
+fn tie_between_two_centroids_in_one_lane_goes_to_the_lower() {
+    // LANES = 16: ids 3 and 19 are both lane 3; ids 20 and 4 likewise (given in descending order).
+    let (row, centroids) = tie_fixture(32, &[3, 19]);
+    assert_matches_oracle(&row, &centroids, 2, &[3], "ids 3, 19");
+    let (row, centroids) = tie_fixture(40, &[20, 4]);
+    assert_matches_oracle(&row, &centroids, 2, &[4], "ids 4, 20");
+}
+
+#[test]
+fn tie_between_two_lanes_goes_to_the_lower() {
+    let (row, centroids) = tie_fixture(32, &[5, 9]);
+    assert_matches_oracle(&row, &centroids, 2, &[5], "ids 5, 9");
+    let (row, centroids) = tie_fixture(32, &[30, 2]);
+    assert_matches_oracle(&row, &centroids, 2, &[2], "ids 2, 30");
+}
+
+#[test]
+fn tie_in_the_tail_goes_to_the_lower() {
+    // k = 21: ids 16..=20 are past the last full group of 16.
+    let (row, centroids) = tie_fixture(21, &[17, 19]);
+    assert_matches_oracle(&row, &centroids, 2, &[17], "tail ids 17, 19");
+    let (row, centroids) = tie_fixture(21, &[18, 4]);
+    assert_matches_oracle(&row, &centroids, 2, &[4], "lane id 4 beats tail id 18");
+    let (row, centroids) = tie_fixture(21, &[20]);
+    assert_matches_oracle(&row, &centroids, 2, &[20], "a lone tail minimum wins");
+}
+
+#[test]
+fn a_row_equal_to_every_centroid_takes_index_zero_with_a_positive_zero_score() {
+    // Gemm L2: `||x||^2 + ||c||^2 - 2 x.c` is exactly 0 for every centroid, the all-zero clamp case.
+    for k in [1, 16, 21, 33] {
+        let rows = [0.0f32; 3];
+        let centroids = vec![0.0f32; k * 3];
+        for kernel in KERNELS {
+            for metric in METRICS {
+                let (labels, scores) = production_nearest(kernel, metric, &rows, &centroids, 3);
+                assert_eq!(labels, [0], "k={k} {kernel:?} {metric:?}");
+                assert_eq!(
+                    scores,
+                    [0.0f32.to_bits()],
+                    "k={k} {kernel:?} {metric:?}: +0.0, never -0.0"
+                );
+                assert_eq!(
+                    (labels, scores),
+                    oracle_nearest(kernel, metric, &rows, &centroids, 3),
+                    "k={k} {kernel:?} {metric:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_clamped_negative_expansion_scores_positive_zero_and_ties_to_the_lowest_index() {
+    // Rows equal to centroids: the Gemm expansion can land a few ulps below 0 and is clamped to +0.0.
+    let d = 17;
+    let centroids = lcg_values(40 * d, 9);
+    let rows = centroids.clone();
+    let (labels, scores) = production_nearest(Kernel::Gemm, Metric::L2, &rows, &centroids, d);
+    assert!(
+        scores
+            .iter()
+            .all(|&s| f32::from_bits(s) >= 0.0 && !f32::from_bits(s).is_sign_negative()),
+        "{scores:?}"
+    );
+    assert_eq!(
+        (labels, scores),
+        oracle_nearest(Kernel::Gemm, Metric::L2, &rows, &centroids, d)
+    );
+}
+
+#[test]
+fn an_all_infinite_score_row_takes_index_zero_and_keeps_the_infinity() {
+    // 1e30 squared overflows f32: L2 scores are +inf for both kernels. Inner product: every product is -inf.
+    for k in [1, 16, 21] {
+        let rows = [1e30f32];
+        let near = vec![0.0f32; k];
+        for kernel in KERNELS {
+            let (labels, scores) = production_nearest(kernel, Metric::L2, &rows, &near, 1);
+            assert_eq!(labels, [0], "L2 k={k} {kernel:?}");
+            assert_eq!(scores, [f32::INFINITY.to_bits()], "L2 k={k} {kernel:?}");
+            assert_eq!(
+                (labels, scores),
+                oracle_nearest(kernel, Metric::L2, &rows, &near, 1),
+                "L2 k={k} {kernel:?}"
+            );
+            let far = vec![-1e30f32; k];
+            let (labels, scores) = production_nearest(kernel, Metric::InnerProduct, &rows, &far, 1);
+            assert_eq!(labels, [0], "IP k={k} {kernel:?}");
+            assert_eq!(scores, [f32::NEG_INFINITY.to_bits()], "IP k={k} {kernel:?}");
+            assert_eq!(
+                (labels, scores),
+                oracle_nearest(kernel, Metric::InnerProduct, &rows, &far, 1),
+                "IP k={k} {kernel:?}"
+            );
+        }
+    }
+}

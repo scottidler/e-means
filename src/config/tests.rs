@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use crate::assign::Kernel;
 use crate::rng::{Stream, StreamId};
 
 fn invalid(builder: &EMeans, n: usize, init: &[f32]) -> String {
@@ -189,6 +190,68 @@ fn train_matches_a_caller_loop_from_the_seeded_init() {
     assert_eq!(bits(model.centroids()), bits(caller.centroids()));
     assert_eq!(objectives(&model), objectives(&caller));
     assert_eq!(model.labels().unwrap(), &row_order(&caller, &order, 50)[..]);
+}
+
+// `train` against a caller loop through the public `accumulate`, inside explicit 1-thread and 8-thread
+// pools: bitwise centroids, epoch stats (objective included) and captured labels. Batches span several
+// 256-row blocks (B=1024 is 4 blocks, 16 tasks at 8 threads), n is not a multiple of B (a short final
+// batch), and T is whole and fractional. Pins the fused `accumulate_indexed` path (Phase 4) and the
+// pool-thread loop with its permutation overlap (Phase 7) to `accumulate`.
+#[test]
+fn train_matches_caller_loop_in_pools() {
+    // (name, d, k, batch_size, n, spherical)
+    let cases = [
+        ("L2 Direct", 8, 16, 1024, 5000, false),
+        ("L2 Gemm", 32, 64, 4096, 10_000, false),
+        ("spherical Direct", 8, 16, 1024, 5000, true),
+        ("spherical Gemm", 32, 64, 4096, 10_000, true),
+    ];
+    let pools: Vec<_> = [1, 8]
+        .into_iter()
+        .map(|threads| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            (threads, pool)
+        })
+        .collect();
+    for (name, d, k, batch, n, spherical) in cases {
+        let kernel = Kernel::for_batch(batch, d);
+        assert_eq!(
+            kernel,
+            if name.ends_with("Gemm") { Kernel::Gemm } else { Kernel::Direct },
+            "{name}: the case's B * d picks the kernel its name says"
+        );
+        assert_ne!(n % batch, 0, "{name}: n is not a multiple of B");
+        let seed = 21;
+        let mut x = values(n * d, 33, 3.0);
+        if spherical {
+            x = unit_rows(x, d);
+        }
+        let init = rows_of(&x, &Stream::new(seed, StreamId::Init).permutation(n)[..k], d);
+        for epochs in [5.0, 2.5] {
+            let builder = EMeans::new(d, k)
+                .epochs(epochs)
+                .batch_size(batch)
+                .alpha0(0.2)
+                .seed(seed)
+                .spherical(spherical);
+            for (threads, pool) in &pools {
+                let (model, caller, order) = pool.install(|| {
+                    let model = builder.train(&x).unwrap();
+                    let (caller, order) = caller_run(&builder, &x, d, &init, seed);
+                    (model, caller, order)
+                });
+                let what = format!("{name} T={epochs} threads={threads}");
+                assert_eq!(bits(model.centroids()), bits(caller.centroids()), "{what}: centroids");
+                assert_eq!(model.epoch_stats(), caller.epoch_stats(), "{what}: epoch stats");
+                assert_eq!(objectives(&model), objectives(&caller), "{what}: objective bits");
+                assert_eq!(
+                    model.labels().unwrap(),
+                    &row_order(&caller, &order, n)[..],
+                    "{what}: captured labels"
+                );
+            }
+        }
+    }
 }
 
 // Design criterion: for T in {0.5, 0.1}, labels are None on exactly the unvisited rows.

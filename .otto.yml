@@ -47,6 +47,22 @@ tasks:
     bash: |
       cargo bench --bench assign --bench train
 
+  # Head-to-head against the emeans crate (NOT part of ci)
+  h2h:
+    help: "Head-to-head vs emeans 0.1.1, ratio gated per cell; --cell NAME... runs just those (NOT part of ci)"
+    params:
+      --cell:
+        default: ""
+        help: "One cell name, or several space-separated inside quotes, e.g. train-d8-default-8t; empty = the whole grid"
+    bash: |
+      # The 1-thread cells are pinned to core 2 by h2h itself (it re-runs each cell in a child under taskset).
+      CELL_ARGS=()
+      if [ -n "${cell}" ]; then
+        # shellcheck disable=SC2206 # word-splitting the space-separated names is the point
+        CELL_ARGS=(--cell ${cell})
+      fi
+      cargo run --release --manifest-path bin/h2h/Cargo.toml -- "${CELL_ARGS[@]}"
+
   # Mutation testing: no args = whole workspace; --diff = scoped to a diff (NOT part of ci)
   mutants:
     help: "Mutation-test the workspace; --diff FILE scopes to a diff (CI use; NOT part of ci)"

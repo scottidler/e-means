@@ -1,0 +1,15 @@
+[package]
+name = "h2h"
+version = "0.0.0"
+edition = "2024"
+description = "Head-to-head of e-means against the emeans crate: interleaved paired timings, gated by ratio"
+publish = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+e-means = { path = "../.." }
+emeans = { git = "https://github.com/savannahar68/emeans", rev = "5b283a9" }
+rayon = "1.12"
+
+# Its own root: not a member of any workspace, so e-means' dev-dependencies stay out of it and its own.
+[workspace]

@@ -30,11 +30,17 @@ impl SplitMix {
 
 /// `N` rows of `d` columns, row `i` from component `i % K`.
 pub fn mixture(d: usize, seed: u64) -> Vec<f32> {
+    mixture_of(N, K, d, seed)
+}
+
+/// `n` rows of `d` columns from `components` equal-size components, row `i` from component
+/// `i % components`.
+pub fn mixture_of(n: usize, components: usize, d: usize, seed: u64) -> Vec<f32> {
     let mut rng = SplitMix(seed);
-    let centers: Vec<f64> = (0..K * d).map(|_| CENTER_SCALE * rng.normal()).collect();
-    let mut x = Vec::with_capacity(N * d);
-    for i in 0..N {
-        let c = i % K;
+    let centers: Vec<f64> = (0..components * d).map(|_| CENTER_SCALE * rng.normal()).collect();
+    let mut x = Vec::with_capacity(n * d);
+    for i in 0..n {
+        let c = i % components;
         for j in 0..d {
             x.push((centers[c * d + j] + rng.normal()) as f32);
         }
