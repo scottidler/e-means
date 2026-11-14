@@ -24,7 +24,7 @@ published nowhere: consumers take a git tag. No BLAS linkage: the Gemm kernel is
 ## Use
 
 ```toml
-e-means = { git = "https://github.com/scottidler/e-means", tag = "v0.1.1", version = "0.1.1" }
+e-means = { git = "https://github.com/scottidler/e-means", tag = "v0.1.0", version = "0.1.0" }
 ```
 
 In-memory data:
